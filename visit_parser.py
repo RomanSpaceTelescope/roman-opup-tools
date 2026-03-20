@@ -13,6 +13,9 @@ import tarfile
 import zipfile
 import argparse
 
+# Columns to make first in the output CSV file (if available)
+PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID']
+
 #%%
 
 def parse_visit_header(visit_header_line):
@@ -712,6 +715,16 @@ def split_df_columns(df, columns_to_split):
     
     return df_1, df_2
 
+def prioritize_columns(df, priority_columns):
+
+    # Filtering out columns that are not available in the given DataFrame
+    priotiry_cols = set(priority_columns) - set(df.columns)
+
+    # Re-order columns in the data frame to prioritize the given columns
+    new_order = priority_columns + [col for col in df.columns if col not in priority_columns]
+
+    return df[new_order]
+
 def find_nontgz_parent(folderpath):
     # Returning the first path in the parents of the given path
     # that is a directory.
@@ -751,16 +764,37 @@ def setup_parser():
 
 def process_OPUPs(opup_filepaths, output_dir=None, keep_GW=True):
 
+    # Iterating through list of opup filepaths
     for opup_filepath in opup_filepaths:
+        # If the output directory is not given, then we use the local directory.
+        # If the local directory is a file (i.e. gzipped archive), then we use the closest non-gzipped parent.
         if output_dir is None:
             output_dir = Path(opup_filepath).parent.as_posix()
+
+            # If the SCF file is stored in a gzipped archive, we have to modify the save path to accommodate this.
+            if not Path(output_dir).is_dir():
+                output_dir = find_nontgz_parent(output_dir)
+
         output_csv = Path(output_dir).joinpath(Path(opup_filepath).stem + '_csv.csv').as_posix()
 
-        write_to_CSV(parse_OPUP(opup_filepath), output_csv, keep_GW=keep_GW)
+        # Parse the opup to get the opup info
+        opup_info = parse_OPUP(opup_filepath)
+
+        # Move priority columns to the left-side of the data frame
+        opup_info = prioritize_columns(opup_info, PRIORITY_COLUMNS)
+
+        # Write to CSV
+        if len(opup_info.columns)>0:
+            write_to_CSV(opup_info, output_csv, keep_GW=keep_GW)
+        else:
+            print(f'No columns were returned for {opup_filepath}')
 
 def process_SCFs(scf_filepaths, output_dir=None, keep_GW=True):
 
+    # Iterating through list of SCF file paths
     for scf_filepath in scf_filepaths:
+        # If the output directory is not given, then we use the local directory.
+        # If the local directory is a file (i.e. gzipped archive), then we use the closest non-gzipped parent.
         if output_dir is None:
             output_dir = Path(scf_filepath).parent.as_posix()
 
@@ -773,13 +807,22 @@ def process_SCFs(scf_filepaths, output_dir=None, keep_GW=True):
         # Parsing SCF
         scf_info = parse_SCF(scf_filepath)
 
+        # Move priority columns to the left-side of the data frame
+        scf_info = prioritize_columns(scf_info, PRIORITY_COLUMNS)
+
         # Writing to CSV
         if len(scf_info.columns)>0:
             write_to_CSV(scf_info, output_csv, keep_GW=keep_GW)
+        else:
+            print(f'No columns were returned for {scf_filepath}')
 
 def process_visits(visit_filepaths, output_dir=None, keep_GW=True):
 
+    # Iterating by visit file path
     for visit_filepath in visit_filepaths:
+
+        # If the output directory is not given, then we use the local directory.
+        # If the local directory is gzipped, we move to the closest non-gzipped parent.
         if output_dir is None:
             output_dir = Path(visit_filepath).parent.as_posix()
 
@@ -787,12 +830,19 @@ def process_visits(visit_filepaths, output_dir=None, keep_GW=True):
             if not Path(output_dir).is_dir():
                 output_dir = find_nontgz_parent(output_dir)
 
+        # Creating output csv file path
         output_csv = Path(output_dir).joinpath(Path(visit_filepath).stem + '_csv.csv').as_posix()
 
+        # Parsing visit file
         visit_info = parse_visit_file(visit_filepath)
+
+        # Move priority columns to the left-side of the data frame
+        visit_info = prioritize_columns(visit_info, PRIORITY_COLUMNS)
 
         if len(visit_info.columns) > 0:
             write_to_CSV(visit_info, output_csv, keep_GW=keep_GW)
+        else:
+            print(f'No columns were returned for {visit_filepath}')
 
 #%%
 
