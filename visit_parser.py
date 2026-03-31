@@ -2652,7 +2652,7 @@ def setup_parser_with_html():
     parser.add_argument('-visit', '--visit_filepath', type=str, nargs='+', help='Path(s) to the visit file(s)', default=[])
     parser.add_argument('-odir', '--output_dir', type=str, help='Output file directory', default=None)
     parser.add_argument('--keep_GW', action='store_true', help='Keep Guide Window information in the output.')
-    parser.add_argument('--format', type=str, choices=['csv', 'html', 'both'], default='csv', 
+    parser.add_argument('--format', type=str, choices=['csv', 'html', 'both'], default='html', 
                        help='Output format: csv, html, or both')
     return parser
 
@@ -2664,7 +2664,7 @@ def setup_parser():
     parser.add_argument('-visit', '--visit_filepath', type=str, nargs='+', help='Path(s) to the visit file(s)', default=[])
     parser.add_argument('-odir', '--output_dir', type=str, help='Output file directory', default=None)
     parser.add_argument('--keep_GW', action='store_true', help='Keep Guide Window information in the output.')
-    parser.add_argument('--format', type=str, choices=['csv', 'html', 'both', 'integrated'], default='csv', 
+    parser.add_argument('--format', type=str, choices=['csv', 'html', 'both', 'integrated'], default='integrated', 
                        help='Output format: csv, html, both, or integrated (html + sky plot)')
     return parser
 
