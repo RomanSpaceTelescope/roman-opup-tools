@@ -1,6 +1,4 @@
-I'll create a downloadable markdown file for you:
 
-```markdown
 # OPUP Visit Parser
 
 A Python tool for parsing NASA Roman Space Telescope OPUP (Observation Plan Upload) files and generating interactive HTML reports with sky plots and visit file syntax highlighting.
