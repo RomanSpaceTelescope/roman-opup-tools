@@ -213,13 +213,3 @@ NASA Open Source - Internal Use
 ---
 
 **Last Updated**: 2026-03-31  
-**Compatible With**: Roman OPUP format specification v1.x
-```
-
-You can copy this entire markdown content and save it as `README.md` in your git repository. Simply:
-
-1. Create a new file named `README.md` in your repository root
-2. Copy and paste the entire content above
-3. Save the file
-
-The markdown will render beautifully on GitHub, GitLab, or any other git hosting platform with proper formatting, tables, code blocks, and emoji support!
