@@ -1223,6 +1223,67 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
             color: #7f8c8d;
             font-weight: bold;
         }}
+
+        /* Program hierarchy styling */
+        .program-header {{
+            background: linear-gradient(to right, #f8f9fa 0%, #ffffff 100%);
+            font-weight: 600;
+            border-left: 5px solid #3498db;
+            padding: 12px 15px !important;
+            margin-bottom: 5px;
+            border-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }}
+        .program-badge {{
+            display: inline-block;
+            color: white;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 13px;
+            font-weight: 700;
+            margin-right: 10px;
+            letter-spacing: 0.5px;
+        }}
+        .purpose-tag {{
+            display: inline-block;
+            background-color: #ecf0f1;
+            color: #34495e;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: 500;
+            margin-left: 8px;
+            font-style: italic;
+        }}
+        .purpose-tag-small {{
+            display: inline-block;
+            background-color: #e8f4f8;
+            color: #2980b9;
+            padding: 2px 6px;
+            border-radius: 2px;
+            font-size: 10px;
+            font-weight: 500;
+            margin-left: 5px;
+            font-style: italic;
+        }}
+        .pass-item {{
+            padding: 8px 15px 8px 40px !important;
+            background-color: #fafafa;
+            border-left: 3px solid #95a5a6;
+            margin-left: 15px;
+            margin-bottom: 3px;
+            border-radius: 0 3px 3px 0;
+        }}
+        .segment-item {{
+            padding: 6px 15px 6px 60px !important;
+            font-size: 11px;
+            color: #7f8c8d;
+            font-style: italic;
+            background-color: #f5f5f5;
+            margin-left: 15px;
+            border-radius: 0 3px 3px 0;
+        }}
+
         .table-wrapper {{
             background-color: white;
             border-radius: 5px;
@@ -1632,22 +1693,157 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
             <div class="summary-detail">All rows in data</div>
         </div>
         <div class="summary-card">
-            <div class="summary-label">Science IDs</div>
-            <div class="summary-value">{unique_sci_ids}</div>
-            <div class="summary-detail">Unique exposures</div>
-        </div>
-        <div class="summary-card">
             <div class="summary-label">Total Duration</div>
             <div class="summary-value time">{total_duration_display}</div>
             <div class="summary-detail">{int(total_duration_seconds):,} seconds</div>
         </div>
-        <div class="summary-card">
-            <div class="summary-label">Data Columns</div>
-            <div class="summary-value">{total_cols}</div>
-            <div class="summary-detail">Parameters tracked</div>
-        </div>
     </div>
 """
+# Add Program/Pass/Segment hierarchy breakdown
+    if 'Visit_ID' in df.columns:
+        unique_visits_df = df.drop_duplicates(subset=['Visit_ID'])
+        
+        # Program breakdown
+        if 'Program_Number' in unique_visits_df.columns:
+            html += """
+    <div class="breakdown-section">
+        <h3>📋 Program Hierarchy</h3>
+"""
+            # Define color palette for programs
+            program_colors = [
+                '#3498db', '#e74c3c', '#2ecc71', '#f39c12', '#9b59b6',
+                '#1abc9c', '#e67e22', '#34495e', '#16a085', '#c0392b'
+            ]
+            
+            # Group by Program
+            if 'Duration' in unique_visits_df.columns:
+                unique_visits_df_copy = unique_visits_df.copy()
+                unique_visits_df_copy['Duration'] = pd.to_numeric(unique_visits_df_copy['Duration'], errors='coerce')
+                
+                prog_breakdown = unique_visits_df_copy.groupby('Program_Number').agg({
+                    'Visit_ID': 'count',
+                    'Duration': 'sum'
+                }).reset_index()
+                prog_breakdown.columns = ['Program', 'Visits', 'Duration']
+            else:
+                prog_breakdown = unique_visits_df.groupby('Program_Number').agg({
+                    'Visit_ID': 'count'
+                }).reset_index()
+                prog_breakdown.columns = ['Program', 'Visits']
+            
+            prog_breakdown = prog_breakdown.sort_values('Program')
+            
+            # Display each program
+            for prog_idx, prog_row in enumerate(prog_breakdown.iterrows()):
+                _, prog_row = prog_row
+                prog_num = prog_row['Program']
+                prog_visits = int(prog_row['Visits'])
+                
+                # Assign color to program
+                prog_color = program_colors[prog_idx % len(program_colors)]
+                
+                # Format duration if available
+                duration_str = ""
+                if 'Duration' in prog_breakdown.columns and prog_row['Duration'] > 0:
+                    hours = int(prog_row['Duration'] // 3600)
+                    minutes = int((prog_row['Duration'] % 3600) // 60)
+                    duration_str = f" | {hours}h {minutes}m"
+                
+                # Get intended purpose for this program if available
+                prog_purpose = ""
+                if 'Intended_Purpose' in unique_visits_df.columns:
+                    prog_data = unique_visits_df[unique_visits_df['Program_Number'] == prog_num]
+                    purposes = prog_data['Intended_Purpose'].dropna().unique()
+                    if len(purposes) > 0:
+                        # Take first purpose or most common if multiple
+                        prog_purpose = purposes[0]
+                        if len(purposes) > 1:
+                            prog_purpose += f" (+{len(purposes)-1} more)"
+                
+                html += f"""        <div class="breakdown-item program-header" style="border-left-color: {prog_color};">
+            <span class="breakdown-label">
+                <span class="program-badge" style="background-color: {prog_color};">Program {prog_num}</span>
+"""
+                
+                if prog_purpose:
+                    html += f"""                <span class="purpose-tag">{prog_purpose}</span>
+"""
+                
+                html += f"""            </span>
+            <span class="breakdown-value">{prog_visits} visits{duration_str}</span>
+        </div>
+"""
+                
+                # Get passes for this program
+                if 'Pass_Number' in unique_visits_df.columns:
+                    prog_data = unique_visits_df[unique_visits_df['Program_Number'] == prog_num]
+                    
+                    if 'Duration' in prog_data.columns:
+                        prog_data_copy = prog_data.copy()
+                        prog_data_copy['Duration'] = pd.to_numeric(prog_data_copy['Duration'], errors='coerce')
+                        
+                        pass_breakdown = prog_data_copy.groupby('Pass_Number').agg({
+                            'Visit_ID': 'count',
+                            'Duration': 'sum'
+                        }).reset_index()
+                        pass_breakdown.columns = ['Pass', 'Visits', 'Duration']
+                    else:
+                        pass_breakdown = prog_data.groupby('Pass_Number').agg({
+                            'Visit_ID': 'count'
+                        }).reset_index()
+                        pass_breakdown.columns = ['Pass', 'Visits']
+                    
+                    pass_breakdown = pass_breakdown.sort_values('Pass')
+                    
+                    # Display passes under this program
+                    for _, pass_row in pass_breakdown.iterrows():
+                        pass_num = pass_row['Pass']
+                        pass_visits = int(pass_row['Visits'])
+                        
+                        # Format duration if available
+                        pass_duration_str = ""
+                        if 'Duration' in pass_breakdown.columns and pass_row['Duration'] > 0:
+                            hours = int(pass_row['Duration'] // 3600)
+                            minutes = int((pass_row['Duration'] % 3600) // 60)
+                            pass_duration_str = f" | {hours}h {minutes}m"
+                        
+                        # Get intended purposes for this pass
+                        pass_purposes = ""
+                        if 'Intended_Purpose' in unique_visits_df.columns:
+                            pass_data = prog_data[prog_data['Pass_Number'] == pass_num]
+                            purposes = pass_data['Intended_Purpose'].dropna().unique()
+                            if len(purposes) > 0:
+                                # Show all unique purposes for this pass
+                                if len(purposes) == 1:
+                                    pass_purposes = f' <span class="purpose-tag-small">{purposes[0]}</span>'
+                                else:
+                                    pass_purposes = f' <span class="purpose-tag-small">{len(purposes)} purposes</span>'
+                        
+                        html += f"""        <div class="breakdown-item pass-item" style="border-left-color: {prog_color};">
+            <span class="breakdown-label">└─ Pass {pass_num}{pass_purposes}</span>
+            <span class="breakdown-value">{pass_visits} visits{pass_duration_str}</span>
+        </div>
+"""
+                        
+                        # Get segments for this pass (if available)
+                        if 'Segment_Number' in unique_visits_df.columns:
+                            pass_data = prog_data[prog_data['Pass_Number'] == pass_num]
+                            segments = pass_data['Segment_Number'].unique()
+                            segments = sorted([s for s in segments if pd.notna(s)])
+                            
+                            if len(segments) > 0:
+                                if len(segments) <= 5:
+                                    segment_list = ', '.join([f"S{int(s):03d}" for s in segments])
+                                else:
+                                    segment_list = ', '.join([f"S{int(s):03d}" for s in segments[:5]]) + f" ... (+{len(segments)-5} more)"
+                                
+                                html += f"""        <div class="breakdown-item segment-item">
+            <span class="breakdown-label">   └─ Segments: {segment_list}</span>
+            <span class="breakdown-value">{len(segments)} total</span>
+        </div>
+"""
+            
+            html += "    </div>\n"
 
     # Add instrument breakdown if available
     if 'Science_Instrument' in df.columns:
