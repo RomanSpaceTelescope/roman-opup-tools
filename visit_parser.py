@@ -1641,6 +1641,56 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
             70% {{ opacity: 1; }}
             100% {{ opacity: 0; }}
         }}
+
+        /* Collapsible observation group styles */
+        .group-header-row {{
+            cursor: pointer;
+        }}
+        .group-header-row td:first-child {{
+            position: relative;
+        }}
+        .expand-btn {{
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            line-height: 20px;
+            text-align: center;
+            background-color: #3498db;
+            color: white;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: bold;
+            cursor: pointer;
+            margin-right: 5px;
+            user-select: none;
+            vertical-align: middle;
+        }}
+        .expand-btn:hover {{
+            background-color: #2980b9;
+        }}
+        .expand-btn.expanded {{
+            background-color: #e74c3c;
+        }}
+        .group-child-row {{
+            display: none;
+            background-color: #f9f9f9 !important;
+        }}
+        .group-child-row.visible {{
+            display: table-row;
+        }}
+        .group-child-row td {{
+            border-top: 1px dashed #ddd !important;
+        }}
+        .obs-count-badge {{
+            display: inline-block;
+            background-color: #e67e22;
+            color: white;
+            padding: 1px 6px;
+            border-radius: 10px;
+            font-size: 10px;
+            margin-left: 5px;
+            vertical-align: middle;
+        }}
     </style>
 </head>
 <body>
@@ -1964,7 +2014,20 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
         </div>
 """
         html += "    </div>\n"
-    
+        
+    # Determine if grouping is possible (needed for both buttons and row generation)
+    GROUP_COLS = ['Program_Number', 'Exec_Plan_Number', 'Pass_Number', 
+                  'Segment_Number', 'Observation_Number']
+    group_cols_present = all(col in df.columns for col in GROUP_COLS)
+        # Add expand/collapse controls above the table
+    if group_cols_present:
+        html += """
+    <div class="group-controls">
+        <button class="expand-all-btn" onclick="toggleAllVisitGroups(true)">▼ Expand All Visits</button>
+        <button class="collapse-all-btn" onclick="toggleAllVisitGroups(false)">▶ Collapse All Visits</button>
+    </div>
+"""
+
     html += f"""
     <div class="scroll-indicator">
         Scroll horizontally to view all {len(df.columns)} columns | First columns are fixed for easy reference | Click visit file names to view content
@@ -1986,37 +2049,93 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
                 <tbody>
 """
     
-    # Add table rows
-    for idx, row in df.iterrows():
-        html += "                    <tr>\n"
+# ================================================================
+    # Add table rows with visit-level grouping/collapsing
+    # ================================================================
+    # Group by Program + Exec Plan + Pass + Segment + Observation
+    # Rows sharing these 5 columns are different exposures of the same visit
+    # GROUP_COLS = ['Program_Number', 'Exec_Plan_Number', 'Pass_Number', 
+    #               'Segment_Number', 'Observation_Number']
+    
+    # group_cols_present = all(col in df.columns for col in GROUP_COLS)
+    
+    # Helper function to format a single cell
+    def _format_cell(col, value):
+        if pd.isna(value):
+            return ""
+        elif col in ['Visit_ID', 'SCI_ID']:
+            return f'<span class="highlight">{html_module.escape(str(value))}</span>'
+        elif col == 'Visit_File_Name' and str(value).endswith('.vst'):
+            vf = str(value)
+            return (f'<a href="#" class="visit-link" onclick="showVisitContent(\'{vf}\'); '
+                    f'return false;" title="Click to view {vf}">{vf}</a>')
+        else:
+            return html_module.escape(str(value))
+    
+    if group_cols_present:
+        # Build group key per row and identify groups
+        df_temp = df.copy()
+        df_temp['_group_key'] = df_temp[GROUP_COLS].astype(str).agg('|'.join, axis=1)
         
-        for col in df.columns:
-            value = row[col]
+        # Count rows per group
+        group_sizes = df_temp.groupby('_group_key', sort=False).size()
+        
+        # Track group transitions
+        current_group = None
+        group_counter = 0
+        row_in_group = 0
+        
+        for idx, row in df_temp.iterrows():
+            gk = row['_group_key']
+            n_rows = group_sizes[gk]
             
-            # Format the cell content
-            if pd.isna(value):
-                cell_content = ""
-            elif col == 'Visit_File_Name':
-                # Create clickable link to view visit file content
-                visit_file = str(value)
-                # Use double quotes for onclick and escape single quotes in filename
-                escaped_filename = visit_file.replace("'", "\\'")
-                cell_content = f'<a href="#" class="visit-link" onclick="showVisitContent(\'{escaped_filename}\'); return false;" title="Click to view {visit_file}">{visit_file}</a>'
-            elif col == 'Visit_ID':
-                # Highlight Visit ID
-                cell_content = f'<span class="highlight">{value}</span>'
-            elif col == 'SCI_ID':
-                # Also highlight SCI_ID
-                cell_content = f'<span class="highlight">{value}</span>'
-            elif isinstance(value, float):
-                # Format floats with reasonable precision
-                cell_content = f"{value:.6g}"
+            if gk != current_group:
+                # New group starts
+                current_group = gk
+                group_counter += 1
+                row_in_group = 0
+                group_id = f"vgrp_{group_counter}"
             else:
-                cell_content = str(value)
+                row_in_group += 1
             
-            html += f"                        <td>{cell_content}</td>\n"
-        
-        html += "                    </tr>\n"
+            # --- Determine row class ---
+            if n_rows <= 1:
+                # Single-exposure visit: render normally, no grouping needed
+                html += "                    <tr>\n"
+            elif row_in_group == 0:
+                # First exposure = summary header row
+                html += f'                    <tr class="group-header-row" data-group="{group_id}">\n'
+            else:
+                # Subsequent exposures = hidden child rows
+                html += f'                    <tr class="group-child-row" data-group="{group_id}">\n'
+            
+            # --- Render cells ---
+            for col_idx, col in enumerate(df.columns):
+                value = row[col]
+                cell_content = _format_cell(col, value)
+                
+                # Prepend expand button to the first column of multi-exposure header row
+                if col_idx == 0 and n_rows > 1 and row_in_group == 0:
+                    cell_content = (
+                        f'<span class="expand-btn" '
+                        f'onclick="toggleVisitGroup(\'{group_id}\', this); event.stopPropagation();" '
+                        f'title="Click to show/hide {n_rows} exposures">▶</span>'
+                        f'{cell_content}'
+                        f'<span class="exp-count-badge">{n_rows} exp</span>'
+                    )
+                
+                html += f"                        <td>{cell_content}</td>\n"
+            
+            html += "                    </tr>\n"
+            
+    else:
+        # Fallback: grouping columns not available, render all rows flat
+        for idx, row in df.iterrows():
+            html += "                    <tr>\n"
+            for col in df.columns:
+                cell_content = _format_cell(col, row[col])
+                html += f"                        <td>{cell_content}</td>\n"
+            html += "                    </tr>\n"
     
     html += f"""                </tbody>
             </table>
@@ -2218,6 +2337,44 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
         
         // Test that everything loaded
         console.log('Script loaded successfully');
+
+        function toggleVisitGroup(groupId, btn) {{
+            var childRows = document.querySelectorAll('tr.group-child-row[data-group="' + groupId + '"]');
+            var isExpanded = btn.classList.contains('expanded');
+            
+            for (var i = 0; i < childRows.length; i++) {{
+                if (isExpanded) {{
+                    childRows[i].classList.remove('visible');
+                }} else {{
+                    childRows[i].classList.add('visible');
+                }}
+            }}
+            
+            if (isExpanded) {{
+                btn.classList.remove('expanded');
+                btn.textContent = '▶';
+                btn.title = btn.title.replace('hide', 'show');
+            }} else {{
+                btn.classList.add('expanded');
+                btn.textContent = '▼';
+                btn.title = btn.title.replace('show', 'hide');
+            }}
+        }}
+        
+        function toggleAllVisitGroups(expand) {{
+            var buttons = document.querySelectorAll('.expand-btn');
+            for (var i = 0; i < buttons.length; i++) {{
+                var btn = buttons[i];
+                var groupId = btn.closest('tr').getAttribute('data-group');
+                var isExpanded = btn.classList.contains('expanded');
+                if (expand && !isExpanded) {{
+                    toggleVisitGroup(groupId, btn);
+                }} else if (!expand && isExpanded) {{
+                    toggleVisitGroup(groupId, btn);
+                }}
+            }}
+        }}
+
     </script>
 </body>
 </html>
