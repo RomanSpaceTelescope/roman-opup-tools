@@ -16,7 +16,7 @@ import html as html_module
 import json
 
 # Columns to make first in the output CSV file (if available)
-PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID']
+PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA', 'DEC', 'Position_Angle', 'Off-Normal_Roll', 'WFI_SCI_TABLE', 'READFRAMES', 'WFI_Optical_Element']
 
 #%%
 
@@ -756,7 +756,7 @@ def write_to_CSV(df, output_csv, keep_GW=True):
 
     if len(gw_cols)>0:
         # Splitting the Guide Window info from the main dataframe
-        gw_df, df_out = split_df_columns(df, gw_cols)
+        df_out, gw_df  = split_df_columns(df, gw_cols)
 
         # Writing Guide Window info to separate CSV
         gw_df.to_csv(output_csv.replace('.csv', '_GWInfo.csv'), index=False)
@@ -771,14 +771,6 @@ def write_to_CSV(df, output_csv, keep_GW=True):
         # Writing to CSV
         df.to_csv(output_csv, index=False)
 
-def setup_parser():
-    parser = argparse.ArgumentParser(description='Parse OPUP files.')
-    parser.add_argument('-opup', '--opup_filepath', type=str, nargs='+', help='Path(s) to the OPUP file(s)', default=[])
-    parser.add_argument('-scf', '--scf_filepath', type=str, nargs='+', help='Path(s) to the SCF file(s)', default=[])
-    parser.add_argument('-visit', '--visit_filepath', type=str, nargs='+', help='Path(s) to the visit file(s)', default=[])
-    parser.add_argument('-odir', '--output_dir', type=str, help='Output CSV file directory', default=None)
-    parser.add_argument('--keep_GW', action='store_true', help='Keep Guide Window information in the output CSV.')
-    return parser
 
 def process_OPUPs(opup_filepaths, output_dir=None, keep_GW=True):
 
@@ -2805,6 +2797,7 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
 def setup_parser_with_html():
     parser = argparse.ArgumentParser(description='Parse OPUP files.')
     parser.add_argument('-opup', '--opup_filepath', type=str, nargs='+', help='Path(s) to the OPUP file(s)', default=[])
+    parser.add_argument('-opup_dir', '--opup_directory', type=str, help='Directory containing OPUP .tgz archives (will process all found)', default=None)
     parser.add_argument('-scf', '--scf_filepath', type=str, nargs='+', help='Path(s) to the SCF file(s)', default=[])
     parser.add_argument('-visit', '--visit_filepath', type=str, nargs='+', help='Path(s) to the visit file(s)', default=[])
     parser.add_argument('-odir', '--output_dir', type=str, help='Output file directory', default=None)
@@ -2817,14 +2810,656 @@ def setup_parser_with_html():
 def setup_parser():
     parser = argparse.ArgumentParser(description='Parse OPUP files.')
     parser.add_argument('-opup', '--opup_filepath', type=str, nargs='+', help='Path(s) to the OPUP file(s)', default=[])
+    parser.add_argument('-opup_dir', '--opup_directory', type=str, help='Directory containing OPUP .tgz archives (will process all found)', default=None)
     parser.add_argument('-scf', '--scf_filepath', type=str, nargs='+', help='Path(s) to the SCF file(s)', default=[])
     parser.add_argument('-visit', '--visit_filepath', type=str, nargs='+', help='Path(s) to the visit file(s)', default=[])
     parser.add_argument('-odir', '--output_dir', type=str, help='Output file directory', default=None)
     parser.add_argument('--keep_GW', action='store_true', help='Keep Guide Window information in the output.')
+    parser.add_argument('--gantt', type=str, help='Generate Gantt chart from aggregated CSV file')
     parser.add_argument('--format', type=str, choices=['csv', 'html', 'both', 'integrated'], default='integrated', 
                        help='Output format: csv, html, both, or integrated (html + sky plot)')
     return parser
 
+
+def find_opup_files_in_directory(directory):
+    """
+    Recursively find all .tgz OPUP archive files in the given directory.
+    
+    Args:
+        directory: Path to directory to search
+        
+    Returns:
+        List of paths to .tgz files found
+    """
+    from pathlib import Path
+    
+    directory = Path(directory)
+    
+    if not directory.exists():
+        print(f"Warning: Directory does not exist: {directory}")
+        return []
+    
+    if not directory.is_dir():
+        print(f"Warning: Path is not a directory: {directory}")
+        return []
+    
+    # Find all .tgz files recursively
+    opup_files = list(directory.rglob('*.tgz'))
+    
+    # Also look for .tar.gz files
+    opup_files.extend(directory.rglob('*.tar.gz'))
+    
+    # Convert to strings
+    opup_files = [str(f) for f in opup_files]
+    
+    print(f"Found {len(opup_files)} OPUP archive(s) in {directory}")
+    for opup_file in opup_files:
+        print(f"  - {Path(opup_file).name}")
+    
+    return opup_files
+
+def aggregate_opup_dataframes(opup_filepaths, output_dir=None, keep_GW=True):
+    """
+    Process multiple OPUP files and aggregate all data into a single DataFrame.
+    
+    Args:
+        opup_filepaths: List of paths to OPUP .tgz archives
+        output_dir: Output directory for aggregated results
+        keep_GW: Whether to keep Guide Window columns
+        
+    Returns:
+        pd.DataFrame: Aggregated DataFrame containing all OPUP data
+    """
+    from pathlib import Path
+    import pandas as pd
+    
+    if not opup_filepaths:
+        print("Warning: No OPUP files to process")
+        return pd.DataFrame()
+    
+    print(f"\n{'='*60}")
+    print(f"Aggregating {len(opup_filepaths)} OPUP file(s)")
+    print(f"{'='*60}\n")
+    
+    all_opup_data = []
+    
+    for i, opup_filepath in enumerate(opup_filepaths, 1):
+        try:
+            print(f"[{i}/{len(opup_filepaths)}] Processing: {Path(opup_filepath).name}")
+            
+            # Parse OPUP
+            opup_info = parse_OPUP(opup_filepath)
+            opup_info = prioritize_columns(opup_info, PRIORITY_COLUMNS)
+            
+            if len(opup_info) > 0:
+                # Add source file column to track which OPUP each row came from
+                opup_info['OPUP_Source'] = Path(opup_filepath).stem
+                all_opup_data.append(opup_info)
+                print(f"  ✅ Extracted {len(opup_info)} visits")
+            else:
+                print(f"  ⚠️  No data extracted")
+                
+        except Exception as e:
+            print(f"  ❌ Error processing {Path(opup_filepath).name}: {e}")
+            continue
+    
+    # Combine all dataframes
+    if not all_opup_data:
+        print("\n❌ No data was successfully extracted from any OPUP files")
+        return pd.DataFrame()
+    
+    print(f"\n{'='*60}")
+    print(f"Combining data from {len(all_opup_data)} OPUP file(s)...")
+    print(f"{'='*60}\n")
+    
+    # Concatenate all dataframes
+    aggregated_df = pd.concat(all_opup_data, ignore_index=True)
+    
+    # Sort by OPUP source and visit ID if available
+    if 'Visit_ID' in aggregated_df.columns:
+        aggregated_df = aggregated_df.sort_values(['OPUP_Source', 'Visit_ID'])
+    else:
+        aggregated_df = aggregated_df.sort_values('OPUP_Source')
+    
+    print(f"✅ Total visits aggregated: {len(aggregated_df)}")
+    print(f"   Columns: {len(aggregated_df.columns)}")
+    print(f"   OPUPs represented: {aggregated_df['OPUP_Source'].nunique()}")
+    
+    # Determine output directory
+    if output_dir is None:
+        output_dir = Path(opup_filepaths[0]).parent
+        if not output_dir.is_dir():
+            output_dir = find_nontgz_parent(str(output_dir))
+    
+    output_dir = Path(output_dir)
+    
+    # Save aggregated CSV
+    timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+    output_csv = output_dir / f"aggregated_opups_{timestamp}.csv"
+    
+    print(f"\n💾 Saving aggregated data to: {output_csv}")
+    write_to_CSV(aggregated_df, str(output_csv), keep_GW=keep_GW)
+    
+    # Generate summary statistics
+    print(f"\n{'='*60}")
+    print("Summary Statistics")
+    print(f"{'='*60}")
+    
+    # Count visits per OPUP
+    visits_per_opup = aggregated_df.groupby('OPUP_Source').size()
+    print("\nVisits per OPUP:")
+    for opup_name, count in visits_per_opup.items():
+        print(f"  {opup_name}: {count} visits")
+    
+    # Check for common columns
+    if 'Filter' in aggregated_df.columns:
+        print("\nFilter distribution:")
+        filter_counts = aggregated_df['Filter'].value_counts()
+        for filter_name, count in filter_counts.items():
+            print(f"  {filter_name}: {count} visits")
+    
+    if 'Optical_Element' in aggregated_df.columns:
+        print("\nOptical Element distribution:")
+        oe_counts = aggregated_df['Optical_Element'].value_counts()
+        for oe_name, count in oe_counts.items():
+            print(f"  {oe_name}: {count} visits")
+    
+    print(f"\n{'='*60}")
+    print(f"✅ Aggregation complete!")
+    print(f"{'='*60}\n")
+    
+    return aggregated_df, str(output_csv)
+
+def create_opup_gantt_chart(csv_filepath, output_dir=None):
+    """
+    Create a Gantt chart showing schedulability windows for OPUPs.
+    
+    Shows:
+    - Earliest start to Latest start window (schedulability window)
+    - Actual scheduled start time
+    - Visit execution windows
+    
+    Args:
+        csv_filepath: Path to aggregated CSV file
+        output_dir: Output directory for the chart (defaults to same as CSV)
+        
+    Returns:
+        Path to generated HTML Gantt chart
+    """
+    import pandas as pd
+    import plotly.figure_factory as ff
+    import plotly.graph_objects as go
+    from datetime import datetime, timedelta
+    from pathlib import Path
+    
+    print(f"\n{'='*60}")
+    print("Creating OPUP Schedulability Gantt Chart")
+    print(f"{'='*60}\n")
+    
+    # Load data
+    df = pd.read_csv(csv_filepath)
+    
+    # Parse time columns
+    def parse_time_column(time_str):
+        """Parse time string in format '2026-274-14:23:59 TAI' to datetime"""
+        if pd.isna(time_str):
+            return None
+        
+        time_str = str(time_str).strip()
+        # Remove timezone suffix
+        time_str = time_str.split()[0] if ' ' in time_str else time_str
+        
+        # Parse YYYY-DDD-HH:MM:SS format
+        try:
+            parts = time_str.split('-')
+            year = int(parts[0])
+            doy = int(parts[1])
+            
+            if len(parts) > 2:
+                time_parts = parts[2].split(':')
+                hour = int(time_parts[0])
+                minute = int(time_parts[1])
+                second = int(time_parts[2]) if len(time_parts) > 2 else 0
+            else:
+                hour = minute = second = 0
+            
+            # Convert day-of-year to datetime
+            dt = datetime(year, 1, 1) + timedelta(days=doy - 1, hours=hour, minutes=minute, seconds=second)
+            return dt
+        except Exception as e:
+            print(f"Warning: Could not parse time '{time_str}': {e}")
+            return None
+    
+    # Parse all time columns
+    df['Start_dt'] = df['Start'].apply(parse_time_column)
+    df['Earliest_Start_dt'] = df['Earliest_Start_Time'].apply(parse_time_column)
+    df['Latest_Start_dt'] = df['Latest_Start_Time'].apply(parse_time_column)
+    df['Latest_End_dt'] = df['Latest_End_Time'].apply(parse_time_column)
+    
+    # Get unique OPUPs and sort by earliest Start time
+    opup_start_times = {}
+    for opup in df['OPUP_Source'].unique():
+        opup_df = df[df['OPUP_Source'] == opup]
+        min_start = opup_df['Start_dt'].min()
+        opup_start_times[opup] = min_start if pd.notna(min_start) else datetime.max
+    
+    # Sort OPUPs by start time
+    opups = sorted(opup_start_times.keys(), key=lambda x: opup_start_times[x])
+    
+    print(f"Found {len(opups)} unique OPUP(s)")
+    print("\nOPUP order (by earliest Start time):")
+    for i, opup in enumerate(opups, 1):
+        start_time = opup_start_times[opup]
+        time_str = start_time.strftime('%Y-%m-%d %H:%M:%S') if start_time != datetime.max else 'N/A'
+        print(f"  {i}. {opup.replace('_opup', '').replace('.tgz', '')} @ {time_str}")
+    
+    # Prepare data for Gantt chart
+    gantt_data = []
+    colors = {}
+    color_palette = ['#3498db', '#e74c3c', '#2ecc71', '#f39c12', '#9b59b6', 
+                     '#1abc9c', '#e67e22', '#34495e', '#16a085', '#c0392b']
+    
+    # Create OPUP display names with purposes
+    opup_display_names = {}
+    
+    for idx, opup in enumerate(opups):
+        opup_df = df[df['OPUP_Source'] == opup].copy()
+        opup_short = opup.replace('_opup', '').replace('.tgz', '')
+        colors[opup] = color_palette[idx % len(color_palette)]
+        
+        # Check if there's a single unique Intended_Purpose
+        if 'Intended_Purpose' in df.columns:
+            unique_purposes = opup_df['Intended_Purpose'].dropna().unique()
+            if len(unique_purposes) == 1:
+                purpose = unique_purposes[0]
+                # Truncate if too long
+                if len(purpose) > 50:
+                    purpose = purpose[:47] + "..."
+                opup_display_names[opup] = f"{opup_short} | {purpose}"
+            else:
+                opup_display_names[opup] = opup_short
+        else:
+            opup_display_names[opup] = opup_short
+        
+        print(f"\nProcessing: {opup_display_names[opup]}")
+        print(f"  Visits: {len(opup_df)}")
+        
+        # Get overall OPUP window (min earliest, max latest)
+        earliest_start = opup_df['Earliest_Start_dt'].min()
+        latest_start = opup_df['Latest_Start_dt'].max()
+        latest_end = opup_df['Latest_End_dt'].max()
+        
+        if pd.notna(earliest_start) and pd.notna(latest_start):
+            # 1. Schedulability window (earliest to latest start)
+            gantt_data.append(dict(
+                Task=opup_display_names[opup],
+                Start=earliest_start,
+                Finish=latest_start,
+                Resource='Schedulability Window',
+                Description=f'OPUP can be scheduled anytime in this window'
+            ))
+            
+            # 2. Execution window (latest start to latest end)
+            if pd.notna(latest_end):
+                gantt_data.append(dict(
+                    Task=opup_display_names[opup],
+                    Start=latest_start,
+                    Finish=latest_end,
+                    Resource='Execution Window',
+                    Description=f'Must complete by this time'
+                ))
+        
+        # 3. Individual visit execution times
+        for _, visit in opup_df.iterrows():
+            if pd.notna(visit['Start_dt']) and 'Duration' in visit and pd.notna(visit['Duration']):
+                visit_end = visit['Start_dt'] + timedelta(seconds=visit['Duration'])
+                visit_id = visit.get('Visit_ID', 'Unknown')
+                
+                gantt_data.append(dict(
+                    Task=opup_display_names[opup],
+                    Start=visit['Start_dt'],
+                    Finish=visit_end,
+                    Resource='Scheduled Visit',
+                    Description=f'Visit {visit_id}'
+                ))
+    
+    if not gantt_data:
+        print("❌ No valid scheduling data found")
+        return None
+    
+    # Create figure
+    fig = ff.create_gantt(
+        gantt_data,
+        colors={
+            'Schedulability Window': 'rgba(52, 152, 219, 0.3)',  # Light blue
+            'Execution Window': 'rgba(241, 196, 15, 0.4)',        # Light yellow
+            'Scheduled Visit': 'rgba(46, 204, 113, 0.8)'          # Green
+        },
+        index_col='Resource',
+        show_colorbar=True,
+        group_tasks=True,
+        showgrid_x=True,
+        showgrid_y=True,
+        title='OPUP Schedulability Timeline (Ordered by Start Time)',
+        height=400 + len(opups) * 80  # Increased height per OPUP for longer labels
+    )
+    
+    # Update layout
+    fig.update_layout(
+        xaxis_title="Date/Time",
+        yaxis_title="OPUP (Chronological Order)",
+        font=dict(size=11),
+        hovermode='closest',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        xaxis=dict(
+            gridcolor='lightgray',
+            showgrid=True,
+            tickformat='%Y-%m-%d\n%H:%M',
+            dtick=86400000.0  # 1 day in milliseconds
+        ),
+        yaxis=dict(
+            gridcolor='lightgray',
+            showgrid=True,
+            tickfont=dict(size=10)  # Smaller font for longer labels
+        ),
+        legend=dict(
+            title="Legend",
+            orientation="v",
+            yanchor="top",
+            y=1,
+            xanchor="left",
+            x=1.01
+        ),
+        margin=dict(l=300)  # Increase left margin for longer OPUP names
+    )
+    
+    # Add annotations
+    fig.add_annotation(
+        text="<b>Schedulability Window</b>: OPUP can start anytime in this range<br>" +
+             "<b>Execution Window</b>: Latest possible execution period<br>" +
+             "<b>Scheduled Visit</b>: Actual scheduled visit execution<br>" +
+             "<i>OPUPs ordered from earliest to latest start time</i>",
+        xref="paper", yref="paper",
+        x=0.5, y=-0.1,
+        showarrow=False,
+        font=dict(size=10),
+        align="center",
+        bgcolor="rgba(255, 255, 255, 0.8)",
+        bordercolor="gray",
+        borderwidth=1
+    )
+    
+    # Determine output path
+    if output_dir is None:
+        output_dir = Path(csv_filepath).parent
+    else:
+        output_dir = Path(output_dir)
+    
+    output_html = output_dir / f"opup_gantt_chart_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.html"
+    
+    # Save figure
+    fig.write_html(str(output_html))
+    
+    print(f"\n{'='*60}")
+    print("✅ Gantt Chart Generated!")
+    print(f"{'='*60}")
+    print(f"\n📊 Chart saved to: {output_html}")
+    print(f"\nOpen in browser to view interactive chart\n")
+    
+    return str(output_html)
+
+def create_detailed_opup_schedule(csv_filepath, output_dir=None):
+    """
+    Create a detailed multi-panel visualization showing:
+    1. Overall OPUP timeline
+    2. Visit-level details for each OPUP (with aligned time axes)
+    3. Statistics summary
+    
+    Args:
+        csv_filepath: Path to aggregated CSV file
+        output_dir: Output directory for the chart
+        
+    Returns:
+        Path to generated HTML visualization
+    """
+    import pandas as pd
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    from datetime import datetime, timedelta
+    from pathlib import Path
+    
+    print(f"\n{'='*60}")
+    print("Creating Detailed OPUP Schedule Visualization")
+    print(f"{'='*60}\n")
+    
+    # Load data
+    df = pd.read_csv(csv_filepath)
+    
+    # Parse time function
+    def parse_time_column(time_str):
+        if pd.isna(time_str):
+            return None
+        time_str = str(time_str).strip().split()[0]
+        try:
+            parts = time_str.split('-')
+            year = int(parts[0])
+            doy = int(parts[1])
+            if len(parts) > 2:
+                time_parts = parts[2].split(':')
+                hour = int(time_parts[0])
+                minute = int(time_parts[1])
+                second = int(time_parts[2]) if len(time_parts) > 2 else 0
+            else:
+                hour = minute = second = 0
+            dt = datetime(year, 1, 1) + timedelta(days=doy - 1, hours=hour, minutes=minute, seconds=second)
+            return dt
+        except:
+            return None
+    
+    # Parse times
+    df['Start_dt'] = df['Start'].apply(parse_time_column)
+    df['Earliest_Start_dt'] = df['Earliest_Start_Time'].apply(parse_time_column)
+    df['Latest_Start_dt'] = df['Latest_Start_Time'].apply(parse_time_column)
+    df['Latest_End_dt'] = df['Latest_End_Time'].apply(parse_time_column)
+    
+    # Get unique OPUPs and sort by earliest Start time
+    opup_start_times = {}
+    for opup in df['OPUP_Source'].unique():
+        opup_df = df[df['OPUP_Source'] == opup]
+        min_start = opup_df['Start_dt'].min()
+        opup_start_times[opup] = min_start if pd.notna(min_start) else datetime.max
+    
+    # Sort OPUPs by start time
+    opups = sorted(opup_start_times.keys(), key=lambda x: opup_start_times[x])
+    n_opups = len(opups)
+    
+    print(f"Found {n_opups} unique OPUP(s), ordered by start time")
+    
+    # Calculate global time range for alignment
+    global_min_time = df['Earliest_Start_dt'].min()
+    global_max_time = df['Latest_End_dt'].max()
+    
+    # Add some padding (5% on each side)
+    time_range = global_max_time - global_min_time
+    padding = time_range * 0.05
+    global_min_time -= padding
+    global_max_time += padding
+    
+    print(f"\nGlobal time range: {global_min_time.strftime('%Y-%m-%d %H:%M')} to {global_max_time.strftime('%Y-%m-%d %H:%M')}")
+    
+    # Create OPUP display names with purposes
+    opup_display_names = {}
+    for opup in opups:
+        opup_df = df[df['OPUP_Source'] == opup]
+        opup_short = opup.replace('_opup', '').replace('.tgz', '')
+        
+        # Check if there's a single unique Intended_Purpose
+        if 'Intended_Purpose' in df.columns:
+            unique_purposes = opup_df['Intended_Purpose'].dropna().unique()
+            if len(unique_purposes) == 1:
+                purpose = unique_purposes[0]
+                # Truncate if too long
+                if len(purpose) > 40:
+                    purpose = purpose[:37] + "..."
+                opup_display_names[opup] = f"{opup_short}<br>{purpose}"
+            else:
+                opup_display_names[opup] = opup_short
+        else:
+            opup_display_names[opup] = opup_short
+    
+    # Create subplots with shared x-axis
+    fig = make_subplots(
+        rows=n_opups + 1,
+        cols=1,
+        subplot_titles=['Overall OPUP Timeline (Chronological Order)'] + [opup_display_names[opup] for opup in opups],
+        vertical_spacing=0.05,
+        row_heights=[0.3] + [0.7/n_opups] * n_opups,
+        shared_xaxes=True  # This aligns all x-axes
+    )
+    
+    colors = ['#3498db', '#e74c3c', '#2ecc71', '#f39c12', '#9b59b6', 
+              '#1abc9c', '#e67e22', '#34495e', '#16a085', '#c0392b']
+    
+    # Plot 1: Overall timeline
+    for idx, opup in enumerate(opups):
+        opup_df = df[df['OPUP_Source'] == opup]
+        color = colors[idx % len(colors)]
+        
+        earliest = opup_df['Earliest_Start_dt'].min()
+        latest_start = opup_df['Latest_Start_dt'].max()
+        latest_end = opup_df['Latest_End_dt'].max()
+        
+        # Create short name for legend
+        opup_short = opup.replace('_opup', '').replace('.tgz', '')
+        
+        # Schedulability window
+        fig.add_trace(go.Scatter(
+            x=[earliest, latest_start],
+            y=[idx, idx],
+            mode='lines+markers',
+            name=f'{opup_short} - Window',
+            line=dict(color=color, width=10),
+            marker=dict(size=10, symbol='diamond'),
+            showlegend=True,
+            hovertext=f"Start: {opup_start_times[opup].strftime('%Y-%m-%d %H:%M')}"
+        ), row=1, col=1)
+        
+        # Actual scheduled times
+        for _, visit in opup_df.iterrows():
+            if pd.notna(visit['Start_dt']):
+                fig.add_trace(go.Scatter(
+                    x=[visit['Start_dt']],
+                    y=[idx],
+                    mode='markers',
+                    marker=dict(size=8, color='red', symbol='x'),
+                    showlegend=False,
+                    hovertext=f"Visit: {visit.get('Visit_ID', 'N/A')}"
+                ), row=1, col=1)
+    
+    # Plot 2-N: Individual OPUP details (aligned to common time axis)
+    for idx, opup in enumerate(opups):
+        opup_df = df[df['OPUP_Source'] == opup].copy()
+        opup_df = opup_df.sort_values('Start_dt')
+        row_num = idx + 2
+        
+        # Use a consistent y-position (0-1 range) for better alignment visualization
+        y_position = 0.5
+        bar_height = 0.3
+        
+        for visit_idx, (_, visit) in enumerate(opup_df.iterrows()):
+            if pd.notna(visit['Start_dt']) and pd.notna(visit.get('Duration')):
+                start = visit['Start_dt']
+                end = start + timedelta(seconds=visit['Duration'])
+                
+                # Calculate y position based on visit index
+                y_base = visit_idx
+                
+                # Visit bar
+                fig.add_trace(go.Scatter(
+                    x=[start, end, end, start, start],
+                    y=[y_base, y_base, y_base+0.8, y_base+0.8, y_base],
+                    fill='toself',
+                    fillcolor=colors[idx % len(colors)],
+                    line=dict(color='black', width=1),
+                    mode='lines',
+                    name=visit.get('Visit_ID', 'N/A'),
+                    showlegend=False,
+                    hovertext=f"Visit: {visit.get('Visit_ID', 'N/A')}<br>" +
+                              f"Start: {start.strftime('%Y-%m-%d %H:%M:%S')}<br>" +
+                              f"Filter: {visit.get('WFI_Optical_Element', 'N/A')}<br>" +
+                              f"Duration: {visit.get('Duration', 'N/A')}s",
+                    hoverinfo='text'
+                ), row=row_num, col=1)
+                
+                # Schedulability window indicators (horizontal line showing window)
+                if pd.notna(visit['Earliest_Start_dt']) and pd.notna(visit['Latest_Start_dt']):
+                    fig.add_trace(go.Scatter(
+                        x=[visit['Earliest_Start_dt'], visit['Latest_Start_dt']],
+                        y=[y_base+0.4, y_base+0.4],
+                        mode='lines',
+                        line=dict(color='orange', width=2, dash='dot'),
+                        showlegend=False,
+                        hovertext=f"Schedulability window: {visit['Earliest_Start_dt'].strftime('%Y-%m-%d %H:%M')} to {visit['Latest_Start_dt'].strftime('%Y-%m-%d %H:%M')}"
+                    ), row=row_num, col=1)
+                
+                # Add vertical line at actual start time for clarity
+                fig.add_trace(go.Scatter(
+                    x=[start, start],
+                    y=[y_base, y_base+0.8],
+                    mode='lines',
+                    line=dict(color='darkgreen', width=2),
+                    showlegend=False,
+                    hovertext=f"Start: {start.strftime('%Y-%m-%d %H:%M:%S')}"
+                ), row=row_num, col=1)
+    
+    # Update all x-axes to use the same range
+    for i in range(1, n_opups + 2):
+        fig.update_xaxes(
+            range=[global_min_time, global_max_time],
+            tickformat='%Y-%m-%d<br>%H:%M',
+            showgrid=True,
+            gridcolor='lightgray',
+            row=i,
+            col=1
+        )
+    
+    # Update layout
+    fig.update_layout(
+        height=300 + n_opups * 250,  # Increased height for better visibility
+        title_text="OPUP Detailed Schedule Analysis (Aligned Timeline)",
+        showlegend=True,
+        hovermode='closest',
+        plot_bgcolor='white',
+        paper_bgcolor='white'
+    )
+    
+    # Update axes labels
+    fig.update_xaxes(title_text="Date/Time (All plots aligned)", row=n_opups+1, col=1)
+    fig.update_yaxes(title_text="OPUP Index", row=1, col=1)
+    
+    for i in range(n_opups):
+        fig.update_yaxes(
+            title_text="Visit #",
+            showgrid=True,
+            gridcolor='lightgray',
+            row=i+2,
+            col=1
+        )
+    
+    # Save
+    if output_dir is None:
+        output_dir = Path(csv_filepath).parent
+    else:
+        output_dir = Path(output_dir)
+    
+    output_html = output_dir / f"opup_detailed_schedule_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.html"
+    fig.write_html(str(output_html))
+    
+    print(f"\n✅ Detailed schedule saved to: {output_html}")
+    print(f"   All plots aligned to common time axis: {global_min_time.strftime('%Y-%m-%d %H:%M')} to {global_max_time.strftime('%Y-%m-%d %H:%M')}\n")
+    
+    return str(output_html)
 
 if __name__ == '__main__':
     parser = setup_parser()
@@ -2832,21 +3467,70 @@ if __name__ == '__main__':
     
     # Extract args
     opup_filepaths = args.opup_filepath
+    opup_directory = args.opup_directory
     scf_filepaths = args.scf_filepath
     visit_filepaths = args.visit_filepath
     output_dir = args.output_dir
     keep_GW = args.keep_GW
     output_format = args.format
     
+    # If -opup_dir is provided, find all OPUP files in that directory
+    directory_mode = False
+    if opup_directory is not None:
+        found_opups = find_opup_files_in_directory(opup_directory)
+        # Append to any manually specified OPUP files
+        opup_filepaths = list(opup_filepaths) + found_opups
+        directory_mode = len(found_opups) > 0
+    
+    # Remove duplicates while preserving order
+    if opup_filepaths:
+        seen = set()
+        opup_filepaths = [x for x in opup_filepaths if not (x in seen or seen.add(x))]
+    
     # Process based on format
     if output_format == 'integrated':
         # Generate integrated report with sky plotter
         for opup_filepath in opup_filepaths:
             generate_integrated_report(opup_filepath, output_dir, keep_GW)
+        
+        # If in directory mode, also generate aggregated output
+        if directory_mode and len(opup_filepaths) > 1:
+            print("\n" + "="*60)
+            print("Directory mode: Generating aggregated analysis")
+            print("="*60)
+            aggregated_df, csv_path = aggregate_opup_dataframes(opup_filepaths, output_dir, keep_GW)
+            # Generate Gantt charts if we have data
+            if csv_path and not aggregated_df.empty:
+                try:
+                    print("\n" + "="*60)
+                    print("Generating Gantt Charts")
+                    print("="*60)
+                    gantt_path = create_opup_gantt_chart(csv_path, output_dir)
+                    detailed_path = create_detailed_opup_schedule(csv_path, output_dir)
+                    
+                    print("\n" + "="*60)
+                    print("✅ All visualizations complete!")
+                    print("="*60)
+                    print(f"\n📊 Aggregated CSV:     {csv_path}")
+                    print(f"📈 Gantt Chart:        {gantt_path}")
+                    print(f"📉 Detailed Schedule:  {detailed_path}\n")
+                except Exception as e:
+                    print(f"\n⚠️  Error generating Gantt charts: {e}")
+                    import traceback
+                    traceback.print_exc()
     else:
         # Original workflow
         if output_format in ['csv', 'both']:
-            process_OPUPs(opup_filepaths, output_dir, keep_GW)
+            # If in directory mode with multiple OPUPs, aggregate them
+            if directory_mode and len(opup_filepaths) > 1:
+                print("\n" + "="*60)
+                print("Directory mode: Generating aggregated analysis")
+                print("="*60)
+                aggregated_df, csv_path, aggregate_opup_dataframes(opup_filepaths, output_dir, keep_GW)
+            else:
+                # Process individually
+                process_OPUPs(opup_filepaths, output_dir, keep_GW)
+            
             process_SCFs(scf_filepaths, output_dir, keep_GW)
             process_visits(visit_filepaths, output_dir, keep_GW)
         
