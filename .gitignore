@@ -1,2 +1,5 @@
 *.fits
 *.png
+__pycache__/roman_attitude.cpython-312.pyc
+__pycache__/roman_plotter.cpython-312.pyc
+__pycache__/roman_visit_viewer.cpython-312.pyc
