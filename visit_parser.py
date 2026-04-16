@@ -20,6 +20,386 @@ PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA', 'DEC', 'Posit
 
 #%%
 
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend for batch generation
+
+def generate_sky_plot_pngs(opup_filepath, output_dir, df):
+    """
+    For each unique visit in the DataFrame, extract the .vst file from the OPUP,
+    run roman_visit_viewer's plot_manager, and save a PNG.
+
+    Returns:
+        dict: mapping visit_filename (str) -> png_relative_path (str)
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+
+    from roman_visit_viewer import VisitFileParser, plot_manager
+    import shutil
+
+    output_dir = Path(output_dir)
+    png_dir = output_dir / "sky_plots"
+    png_dir.mkdir(exist_ok=True)
+
+    if 'Visit_File_Name' not in df.columns:
+        print("Warning: No Visit_File_Name column; cannot generate sky plots.")
+        return {}
+
+    unique_vst = [v for v in df['Visit_File_Name'].dropna().unique() if str(v).endswith('.vst')]
+    if not unique_vst:
+        return {}
+
+    # ── Use the existing function to bulk-extract all .vst contents at once ──
+    visit_contents = get_all_visit_contents(opup_filepath, unique_vst)
+
+    visit_png_map = {}
+
+    for vst_name, vst_content in visit_contents.items():
+        try:
+            # 1) Write the visit content to a temp file so VisitFileParser can open it
+            tmp_vst = png_dir / vst_name
+            with open(tmp_vst, 'w') as f:
+                f.write(vst_content)
+
+            # 2) Parse and plot
+            parser = VisitFileParser(str(tmp_vst))
+            plot_manager(parser, exp_num=1, savefig=True)
+
+            # 3) plot_manager saves to CWD as "<name>_all.png"
+            #    Move it into our sky_plots directory
+            expected_png = Path(vst_name.replace('.vst', '_all.png'))
+            if expected_png.exists():
+                dest = png_dir / expected_png.name
+                shutil.move(str(expected_png), str(dest))
+                visit_png_map[vst_name] = f"sky_plots/{expected_png.name}"
+                print(f"  🔭 Generated sky plot: {dest}")
+
+            # Clean up temp .vst
+            tmp_vst.unlink(missing_ok=True)
+
+        except Exception as e:
+            print(f"  ⚠️  Could not generate sky plot for {vst_name}: {e}")
+            # Clean up on failure too
+            tmp_vst = png_dir / vst_name
+            if tmp_vst.exists():
+                tmp_vst.unlink(missing_ok=True)
+
+    return visit_png_map
+
+def generate_skyplot_mosaic_html(visit_png_map, opup_name, output_path, df=None):
+    """
+    Generate a standalone HTML mosaic page of all sky plot PNGs.
+    Each image gets an anchor ID so the main report can deep-link to it.
+
+    Args:
+        visit_png_map: dict mapping visit_filename -> relative png path
+        opup_name: str, OPUP name for the page title
+        output_path: Path or str, where to write the HTML
+        df: optional DataFrame to pull metadata (RA, Dec, filter) per visit
+
+    Returns:
+        Path to the generated HTML file, or None if no images
+    """
+    if not visit_png_map:
+        return None
+
+    output_path = Path(output_path)
+
+    # Build metadata lookup from DataFrame if available
+    visit_meta = {}
+    if df is not None and 'Visit_File_Name' in df.columns:
+        for vf in visit_png_map:
+            rows = df[df['Visit_File_Name'] == vf]
+            if len(rows) > 0:
+                row = rows.iloc[0]
+                meta = {}
+                for col in ['Visit_ID', 'RA', 'DEC', 'Position_Angle',
+                            'WFI_Optical_Element', 'Program_Number']:
+                    if col in rows.columns and pd.notna(row.get(col)):
+                        meta[col] = row[col]
+                visit_meta[vf] = meta
+
+    # Sort by visit filename for consistent ordering
+    sorted_visits = sorted(visit_png_map.keys())
+
+    n_visits = len(sorted_visits)
+
+    # ── Build the HTML ──
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sky Plots - {opup_name}</title>
+    <style>
+        * {{
+            box-sizing: border-box;
+        }}
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #1a1a2e;
+            color: #e0e0e0;
+        }}
+        h1 {{
+            color: #e0e0e0;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+            margin-bottom: 5px;
+        }}
+        .subtitle {{
+            color: #95a5a6;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }}
+        .back-link {{
+            display: inline-block;
+            margin-bottom: 15px;
+            color: #3498db;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 14px;
+        }}
+        .back-link:hover {{
+            color: #5dade2;
+            text-decoration: underline;
+        }}
+
+        /* ── Filter bar ── */
+        .filter-bar {{
+            background: #16213e;
+            padding: 12px 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }}
+        .filter-bar label {{
+            font-size: 13px;
+            color: #95a5a6;
+            font-weight: 600;
+        }}
+        .filter-bar input {{
+            padding: 6px 12px;
+            border: 1px solid #34495e;
+            border-radius: 4px;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            font-size: 13px;
+            width: 220px;
+        }}
+        .filter-bar input::placeholder {{
+            color: #5a6a7a;
+        }}
+        .count-badge {{
+            background: #3498db;
+            color: white;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-left: auto;
+        }}
+
+        /* ── Mosaic grid ── */
+        .mosaic {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(520px, 1fr));
+            gap: 16px;
+        }}
+        .card {{
+            background: #16213e;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid #2c3e6e;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }}
+        .card:hover {{
+            border-color: #3498db;
+            box-shadow: 0 4px 20px rgba(52, 152, 219, 0.3);
+        }}
+        .card.highlight {{
+            border-color: #f1c40f;
+            box-shadow: 0 4px 24px rgba(241, 196, 15, 0.4);
+        }}
+        .card-header {{
+            padding: 10px 14px;
+            background: #0f3460;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 6px;
+        }}
+        .card-title {{
+            font-weight: 700;
+            font-size: 13px;
+            color: #e0e0e0;
+            font-family: 'Consolas', 'Courier New', monospace;
+        }}
+        .card-meta {{
+            font-size: 11px;
+            color: #95a5a6;
+        }}
+        .card-meta span {{
+            margin-left: 10px;
+        }}
+        .card img {{
+            width: 100%;
+            height: auto;
+            display: block;
+            cursor: pointer;
+        }}
+
+        /* ── Lightbox ── */
+        .lightbox {{
+            display: none;
+            position: fixed;
+            z-index: 9999;
+            left: 0; top: 0;
+            width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.92);
+            justify-content: center;
+            align-items: center;
+            cursor: zoom-out;
+        }}
+        .lightbox.active {{
+            display: flex;
+        }}
+        .lightbox img {{
+            max-width: 95%;
+            max-height: 95%;
+            border-radius: 6px;
+            box-shadow: 0 0 40px rgba(0,0,0,0.8);
+        }}
+        .lightbox-title {{
+            position: fixed;
+            top: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: white;
+            font-size: 14px;
+            font-weight: 600;
+            background: rgba(0,0,0,0.6);
+            padding: 6px 16px;
+            border-radius: 4px;
+        }}
+    </style>
+</head>
+<body>
+
+    <a href="{opup_name}_report.html" class="back-link">← Back to OPUP Report</a>
+    <h1>🔭 Visit Sky Plots</h1>
+    <p class="subtitle">{opup_name} &mdash; {n_visits} visits</p>
+
+    <div class="filter-bar">
+        <label for="searchBox">Filter:</label>
+        <input type="text" id="searchBox" placeholder="Type visit ID, filter, program..." oninput="filterCards()">
+        <span class="count-badge" id="countBadge">{n_visits} of {n_visits}</span>
+    </div>
+
+    <div class="mosaic" id="mosaic">
+"""
+
+    # ── One card per visit ──
+    for vst_name in sorted_visits:
+        png_path = visit_png_map[vst_name]
+        anchor_id = vst_name.replace('.vst', '')
+        meta = visit_meta.get(vst_name, {})
+
+        # Build metadata spans
+        meta_spans = ""
+        if 'Visit_ID' in meta:
+            meta_spans += f'<span>ID: {meta["Visit_ID"]}</span>'
+        if 'RA' in meta and 'DEC' in meta:
+            meta_spans += f'<span>RA: {float(meta["RA"]):.4f}°</span>'
+            meta_spans += f'<span>Dec: {float(meta["DEC"]):.4f}°</span>'
+        if 'Position_Angle' in meta:
+            meta_spans += f'<span>PA: {float(meta["Position_Angle"]):.2f}°</span>'
+        if 'WFI_Optical_Element' in meta:
+            meta_spans += f'<span>Filter: {meta["WFI_Optical_Element"]}</span>'
+        if 'Program_Number' in meta:
+            meta_spans += f'<span>Prog: {meta["Program_Number"]}</span>'
+
+        # Searchable text blob (hidden, used by JS filter)
+        search_blob = f'{vst_name} {anchor_id} ' + ' '.join(str(v) for v in meta.values())
+
+        html += f"""        <div class="card" id="{anchor_id}" data-search="{search_blob.lower()}">
+            <div class="card-header">
+                <span class="card-title">{vst_name}</span>
+                <span class="card-meta">{meta_spans}</span>
+            </div>
+            <img src="{png_path}" alt="Sky plot for {vst_name}" 
+                 onclick="openLightbox(this.src, '{vst_name}')" loading="lazy">
+        </div>
+"""
+
+    html += """    </div>
+
+    <!-- Lightbox overlay for full-size viewing -->
+    <div class="lightbox" id="lightbox" onclick="closeLightbox()">
+        <span class="lightbox-title" id="lightboxTitle"></span>
+        <img id="lightboxImg" src="" alt="Full size sky plot">
+    </div>
+
+    <script>
+        function filterCards() {
+            const query = document.getElementById('searchBox').value.toLowerCase();
+            const cards = document.querySelectorAll('.card');
+            let visible = 0;
+            cards.forEach(function(card) {
+                const text = card.getAttribute('data-search') || '';
+                if (text.includes(query)) {
+                    card.style.display = '';
+                    visible++;
+                } else {
+                    card.style.display = 'none';
+                }
+            });
+            document.getElementById('countBadge').textContent = visible + ' of ' + cards.length;
+        }
+
+        function openLightbox(src, title) {
+            document.getElementById('lightboxImg').src = src;
+            document.getElementById('lightboxTitle').textContent = title;
+            document.getElementById('lightbox').classList.add('active');
+        }
+
+        function closeLightbox() {
+            document.getElementById('lightbox').classList.remove('active');
+        }
+
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') closeLightbox();
+        });
+
+        // Highlight card if arrived via anchor
+        (function() {
+            var hash = window.location.hash.replace('#', '');
+            if (hash) {
+                var el = document.getElementById(hash);
+                if (el) {
+                    el.classList.add('highlight');
+                    setTimeout(function() { el.scrollIntoView({behavior: 'smooth', block: 'center'}); }, 100);
+                    setTimeout(function() { el.classList.remove('highlight'); }, 3000);
+                }
+            }
+        })();
+    </script>
+
+</body>
+</html>
+"""
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+
+    print(f"  🖼️  Generated sky plot mosaic: {output_path}")
+    return output_path
+
 def parse_visit_header(visit_header_line):
 
     visit_info = {}
@@ -994,7 +1374,7 @@ def extract_visit_file_contents(opup_filepath, visit_filename):
         traceback.print_exc()
         return None
 
-def generate_html_report(df, opup_filepath, sky_plotter_html=None):
+def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map=None, skyplot_mosaic_filename=None):
     """
     Generate HTML content with hyperlinks to visit files and horizontal scrolling.
     Includes embedded visit file contents with syntax highlighting.
@@ -1008,6 +1388,12 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
         HTML string
     """
     opup_name = Path(opup_filepath).name
+
+    if visit_png_map is None:
+        visit_png_map = {}
+    if skyplot_mosaic_filename is None:
+        skyplot_mosaic_filename = ''
+
     
     # Extract all visit file contents
     print("Extracting visit file contents from archive...")
@@ -1090,12 +1476,6 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
             total_duration_seconds = 0
             total_duration_display = "N/A"
     
-    # Prepare sky plotter link HTML
-    sky_plotter_link = ""
-    if sky_plotter_html:
-        sky_plotter_filename = os.path.basename(str(sky_plotter_html))
-        sky_plotter_link = f'<p><strong>🌌 <a href="{sky_plotter_filename}" target="_blank" style="color: #3498db; text-decoration: none; font-weight: bold;">View Sky Plot →</a></strong></p>'
-        
     # Start HTML document
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1125,6 +1505,53 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
             margin: 5px 0;
             font-size: 14px;
         }}
+        .sky-preview-wrapper {{
+            position: relative;
+            display: inline-block;
+        }}
+
+        .sky-preview-tooltip {{
+            display: none;
+            position: absolute;
+            bottom: 125%;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 9999;
+            background: #1a1a2e;
+            border: 2px solid #3498db;
+            border-radius: 8px;
+            padding: 4px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            pointer-events: none;
+        }}
+
+        .sky-preview-tooltip img {{
+            width: 480px;
+            height: auto;
+            border-radius: 4px;
+            display: block;
+        }}
+
+        .sky-preview-tooltip::after {{
+            content: '';
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            border: 8px solid transparent;
+            border-top-color: #3498db;
+        }}
+
+        .sky-preview-wrapper:hover .sky-preview-tooltip {{
+            display: block;
+        }}
+
+        td:nth-last-child(-n+3) .sky-preview-tooltip {{
+            left: auto;
+            right: 0;
+            transform: none;
+        }}
+
         .summary-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -1696,9 +2123,17 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
     # Add sky plotter link if available
     if sky_plotter_html:
         sky_plotter_filename = os.path.basename(sky_plotter_html)
-        html += f"""        <p><strong>🌌 <a href="{sky_plotter_filename}" target="_blank" style="color: #3498db; text-decoration: none; font-weight: bold;">View Sky Plot →</a></strong></p>
+        html += f"""        <p><strong>🌌 <a href="{sky_plotter_filename}" target="_blank" style="color: #3498db; text-decoration: none; font-weight: bold;">Sky Map →</a></strong></p>
 """
     
+    # DEBUG — remove after confirming
+    print(f"  DEBUG: skyplot_mosaic_filename = '{skyplot_mosaic_filename}'")
+
+        # Add sky plot mosaic link if available    
+    if skyplot_mosaic_filename:
+        html += f"""        <p><strong>🔭 <a href="{skyplot_mosaic_filename}" target="_blank" style="color: #3498db; text-decoration: none; font-weight: bold;">Visit Sky Plots →</a></strong></p>
+"""
+
     html += f"""    </div>
 
 
@@ -2059,11 +2494,29 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None):
             return f'<span class="highlight">{html_module.escape(str(value))}</span>'
         elif col == 'Visit_File_Name' and str(value).endswith('.vst'):
             vf = str(value)
-            return (f'<a href="#" class="visit-link" onclick="showVisitContent(\'{vf}\'); '
-                    f'return false;" title="Click to view {vf}">{vf}</a>')
+            png_path = visit_png_map.get(vf, '')
+
+            # Existing: click visit name to view STOL content
+            link_html = (
+                f'<a href="#" class="visit-link" '
+                f'onclick="showVisitContent(\'{vf}\'); return false;" '
+                f'title="Click to view {vf}">{vf}</a>'
+            )
+
+            if png_path and skyplot_mosaic_filename:
+                anchor = vf.replace('.vst', '')
+                link_html += (
+                    f' <a href="{skyplot_mosaic_filename}#{anchor}" '
+                    f'target="_blank" title="View sky plot" '
+                    f'style="text-decoration:none;">🔭</a>'
+                )
+
+            return link_html
         else:
             return html_module.escape(str(value))
-    
+
+
+            
     if group_cols_present:
         # Build group key per row and identify groups
         df_temp = df.copy()
@@ -2554,7 +3007,8 @@ def syntax_highlight_visit_content(content):
         highlighted_lines.append(highlighted_line)
     
     return '\n'.join(highlighted_lines)
-def write_to_HTML(df, output_html, opup_filepath, keep_GW=True):
+def write_to_HTML(df, output_html, opup_filepath, keep_GW=True, 
+                  sky_plotter_html=None, visit_png_map=None):
     """
     Write DataFrame to HTML file with optional GW column removal.
     
@@ -2564,6 +3018,10 @@ def write_to_HTML(df, output_html, opup_filepath, keep_GW=True):
         opup_filepath: Path to OPUP archive
         keep_GW: Whether to keep Guide Window columns
     """
+
+    if visit_png_map is None:
+        visit_png_map = {}
+
     if not keep_GW:
         gw_cols = get_current_gw_columns(df)
         df = df.drop(columns=gw_cols)
@@ -2644,6 +3102,91 @@ def export_unique_visits_for_plotter(df, output_csv):
     
     return output_csv
 
+def _parse_sun_date(opup_info):
+    """Extract observation date from the first visit's Start time for Sun position."""
+    from datetime import datetime, timezone, timedelta
+    
+    if 'Start' not in opup_info.columns:
+        print(f"  ⚠️  No 'Start' column; using today for Sun position")
+        return datetime.now(timezone.utc)
+    
+    first_start = opup_info['Start'].dropna().iloc[0] if len(opup_info['Start'].dropna()) > 0 else None
+    if first_start is None:
+        print(f"  ⚠️  No valid Start times; using today for Sun position")
+        return datetime.now(timezone.utc)
+    
+    # Try YYYY-DDD format (day of year), e.g. "2026-276-13:00:51 TAI"
+    doy_match = re.match(
+        r'^(\d{4})-(\d{1,3})(?:-(\d{2}:\d{2}:\d{2}))?\s*(?:TAI|UTC|TDB|TT)?$',
+        str(first_start).strip(), re.I
+    )
+    if doy_match:
+        year = int(doy_match.group(1))
+        doy = int(doy_match.group(2))
+        if 1 <= doy <= 366:
+            sun_date = datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=doy - 1)
+            print(f"  ☀️  Using date from first visit: {sun_date.strftime('%Y-%m-%d')} (DOY {doy})")
+            return sun_date
+    
+    # Try standard date formats
+    for fmt in ('%Y-%m-%d', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S'):
+        try:
+            sun_date = datetime.strptime(str(first_start).split()[0], fmt).replace(tzinfo=timezone.utc)
+            print(f"  ☀️  Using date from first visit: {sun_date.strftime('%Y-%m-%d')}")
+            return sun_date
+        except ValueError:
+            continue
+    
+    print(f"  ⚠️  Could not parse visit date, using today: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
+    return datetime.now(timezone.utc)
+
+
+def _generate_sky_plotter(opup_stem, output_dir, plotter_csv, sun_date):
+    """Generate the interactive sky plotter HTML via roman_plotter."""
+    sky_plotter_html = output_dir / f"{opup_stem}_skymap.html"
+    
+    script_dir = Path(__file__).parent
+    roman_plotter_path = script_dir / "roman_plotter.py"
+    
+    if not roman_plotter_path.exists():
+        print(f"  ⚠️  roman_plotter.py not found at {roman_plotter_path}")
+        return None
+    
+    try:
+        import sys
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        import roman_plotter
+        
+        import json
+        plotter_data = pd.read_csv(plotter_csv)
+        data_json = plotter_data.to_json(orient='records')
+        preloaded_datasets = [{
+            'fileName': plotter_csv.name,
+            'data_json': data_json
+        }]
+        
+        sun_position = roman_plotter.get_sun_position(sun_date)
+        print(f"  ☀️  Sun RA={sun_position['ra']:.2f}°, Dec={sun_position['dec']:.2f}° "
+              f"(Galactic: l={sun_position['l']:.2f}°, b={sun_position['b']:.2f}°)")
+        
+        html_content = roman_plotter.generate_html(
+            preloaded_datasets=preloaded_datasets,
+            sun_position=sun_position
+        )
+        
+        with open(sky_plotter_html, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        print(f"  ✅ Generated sky plotter: {sky_plotter_html}")
+        return sky_plotter_html
+        
+    except Exception as e:
+        print(f"  ⚠️  Could not generate sky plotter: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
     """
     Generate both the detailed OPUP HTML report and the sky plotter visualization.
@@ -2654,12 +3197,12 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
         keep_GW: Whether to keep Guide Window columns
     
     Returns:
-        Tuple of (html_report_path, sky_plotter_path, csv_path)
+        Tuple of (html_report_path, sky_plotter_path, csv_path, archive_path)
     """
     from pathlib import Path
     from datetime import datetime, timezone
     
-    # Determine output directory
+    # ── Setup ──
     if output_dir is None:
         output_dir = Path(opup_filepath).parent
         if not output_dir.is_dir():
@@ -2668,130 +3211,91 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
     output_dir = Path(output_dir)
     opup_stem = Path(opup_filepath).stem.replace('.tgz', '').replace('.tar', '')
     
+    # Track all generated files for archiving
+    generated_files = []
+    
     print(f"\n{'='*60}")
     print(f"Generating Integrated OPUP Report")
     print(f"{'='*60}\n")
     
-    # 1. Parse OPUP
+    # ── Step 1: Parse OPUP ──
     print("Step 1: Parsing OPUP...")
     opup_info = parse_OPUP(opup_filepath)
     opup_info = prioritize_columns(opup_info, PRIORITY_COLUMNS)
     
-    # 2. Extract date from first visit for Sun position calculation
-    sun_date = None
-    if 'Start' in opup_info.columns:
-        # Get the first non-null Start time
-        first_start = opup_info['Start'].dropna().iloc[0] if len(opup_info['Start'].dropna()) > 0 else None
-        
-        if first_start:
-            # Parse the date - handle formats like "2026-276-13:00:51 TAI"
-            import re
-            # YYYY-DDD format (day of year)
-            doy_match = re.match(r'^(\d{4})-(\d{1,3})(?:-(\d{2}:\d{2}:\d{2}))?\s*(?:TAI|UTC|TDB|TT)?$', str(first_start).strip(), re.I)
-            if doy_match:
-                year = int(doy_match.group(1))
-                doy = int(doy_match.group(2))
-                if 1 <= doy <= 366:
-                    from datetime import timedelta
-                    sun_date = datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=doy - 1)
-                    print(f"  ☀️  Using date from first visit: {sun_date.strftime('%Y-%m-%d')} (DOY {doy})")
-            else:
-                # Try other common formats
-                for fmt in ('%Y-%m-%d', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S'):
-                    try:
-                        sun_date = datetime.strptime(str(first_start).split()[0], fmt).replace(tzinfo=timezone.utc)
-                        print(f"  ☀️  Using date from first visit: {sun_date.strftime('%Y-%m-%d')}")
-                        break
-                    except ValueError:
-                        continue
+    # ── Step 2: Extract date for Sun position ──
+    sun_date = _parse_sun_date(opup_info)
     
-    if sun_date is None:
-        sun_date = datetime.now(timezone.utc)
-        print(f"  ⚠️  Could not parse visit date, using today: {sun_date.strftime('%Y-%m-%d')}")
-    
-    # 3. Generate unique visits CSV for sky plotter
+    # ── Step 3: Sky plotter CSV ──
     print("\nStep 2: Creating sky plotter CSV...")
-    plotter_csv = output_dir / f"{opup_stem}_skyplot.csv"
+    plotter_csv = output_dir / f"{opup_stem}_skymap.csv"
     export_unique_visits_for_plotter(opup_info, plotter_csv)
+    generated_files.append(plotter_csv)
     
-    # 4. Generate sky plotter HTML by importing roman_plotter
+    # ── Step 4: Sky plotter HTML (roman_plotter) ──
     print("\nStep 3: Generating sky plotter...")
-    sky_plotter_html = output_dir / f"{opup_stem}_skyplot.html"
+    sky_plotter_html = _generate_sky_plotter(opup_stem, output_dir, plotter_csv, sun_date)
+    if sky_plotter_html:
+        generated_files.append(sky_plotter_html)
     
-    # Find roman_plotter.py in the same directory as this script
-    script_dir = Path(__file__).parent
-    roman_plotter_path = script_dir / "roman_plotter.py"
-    
-    if roman_plotter_path.exists():
-        try:
-            # Import roman_plotter functions directly
-            import sys
-            if str(script_dir) not in sys.path:
-                sys.path.insert(0, str(script_dir))
-            import roman_plotter
-            
-            # Call the generate function directly
-            # First, load the CSV data
-            import pandas as pd
-            plotter_data = pd.read_csv(plotter_csv)
-            
-            # Create a dataset in the format roman_plotter expects
-            import json
-            data_json = plotter_data.to_json(orient='records')
-            preloaded_datasets = [{
-                'fileName': plotter_csv.name,
-                'data_json': data_json
-            }]
-            
-            # Calculate Sun position for the visit date
-            sun_position = roman_plotter.get_sun_position(sun_date)
-            print(f"  ☀️  Sun RA={sun_position['ra']:.2f}°, Dec={sun_position['dec']:.2f}° "
-                  f"(Galactic: l={sun_position['l']:.2f}°, b={sun_position['b']:.2f}°)")
-            
-            # Generate the HTML
-            html_content = roman_plotter.generate_html(
-                preloaded_datasets=preloaded_datasets,
-                sun_position=sun_position
-            )
-            
-            # Write to file
-            with open(sky_plotter_html, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            
-            print(f"  ✅ Generated sky plotter: {sky_plotter_html}")
-        except Exception as e:
-            print(f"  ⚠️  Warning: Could not generate sky plotter: {e}")
-            import traceback
-            traceback.print_exc()
-            sky_plotter_html = None
-    else:
-        print(f"  ⚠️  Warning: roman_plotter.py not found at {roman_plotter_path}")
-        sky_plotter_html = None
-    
-    # 5. Generate detailed HTML report with link to sky plotter
-    print("\nStep 4: Generating detailed HTML report...")
+    # ── Step 5: Sky plot PNGs ──
+    print("\n🔭 Step 4: Generating sky plot previews...")
+    try:
+        visit_png_map = generate_sky_plot_pngs(opup_filepath, output_dir, opup_info)
+        print(f"   Generated {len(visit_png_map)} sky plot PNGs")
+    except Exception as e:
+        print(f"   ⚠️  Sky plot generation failed: {e}")
+        visit_png_map = {}
+
+    # ── Step 6: Sky plot mosaic HTML ──
+    skyplot_mosaic_filename = ''
+    if visit_png_map:
+        mosaic_path = output_dir / f"{opup_stem}_skyplots.html"
+        result = generate_skyplot_mosaic_html(
+            visit_png_map, opup_stem, mosaic_path, df=opup_info
+        )
+        if result:
+            skyplot_mosaic_filename = mosaic_path.name
+            generated_files.append(mosaic_path)
+
+    # ── Step 7: Main HTML report ──
+    print("\nStep 5: Generating detailed HTML report...")
     html_report = output_dir / f"{opup_stem}_report.html"
-    html_content = generate_html_report(opup_info, opup_filepath, sky_plotter_html)
-    
+    html_content = generate_html_report(
+        opup_info, opup_filepath, sky_plotter_html,
+        visit_png_map=visit_png_map,
+        skyplot_mosaic_filename=skyplot_mosaic_filename
+    )
     with open(html_report, 'w', encoding='utf-8') as f:
         f.write(html_content)
+    generated_files.append(html_report)
     
-    # 6. Optionally generate full CSV
-    print("\nStep 5: Generating full CSV...")
+    # ── Step 8: Full CSV ──
+    print("\nStep 6: Generating full CSV...")
     full_csv = output_dir / f"{opup_stem}_full.csv"
     write_to_CSV(opup_info, full_csv, keep_GW=keep_GW)
-    
+    generated_files.append(full_csv)
+
+    # ── Step 9: Package everything ──
+    print("\nStep 7: Packaging report archive...")
+    archive_path = package_report_archive(opup_stem, output_dir, generated_files)
+
+    # ── Summary ──
     print(f"\n{'='*60}")
     print(f"✅ Complete!")
     print(f"{'='*60}")
     print(f"\n📄 Detailed Report: {html_report}")
     if sky_plotter_html:
         print(f"🌌 Sky Plot:        {sky_plotter_html}")
+    if skyplot_mosaic_filename:
+        print(f"🔭 Sky Plot Mosaic: {output_dir / skyplot_mosaic_filename}")
     print(f"📊 CSV Data:        {full_csv}")
     print(f"📊 Sky Plot CSV:    {plotter_csv}")
+    if archive_path:
+        print(f"📦 Report Archive:  {archive_path}")
     print(f"\nOpen {html_report} in your browser to get started!\n")
     
-    return html_report, sky_plotter_html, full_csv
+    return html_report, sky_plotter_html, full_csv, archive_path
 
 # Add HTML option to command-line parser
 def setup_parser_with_html():
@@ -3060,8 +3564,11 @@ def create_opup_gantt_chart(csv_filepath, output_dir=None):
                      '#1abc9c', '#e67e22', '#34495e', '#16a085', '#c0392b']
     
     # Create OPUP display names with purposes
-    opup_display_names = {}
-    
+    opup_display_names = {} 
+
+    # Store OPUP metadata for second pass
+    opup_metadata = {}
+
     for idx, opup in enumerate(opups):
         opup_df = df[df['OPUP_Source'] == opup].copy()
         opup_short = opup.replace('_opup', '').replace('.tgz', '')
@@ -3072,7 +3579,6 @@ def create_opup_gantt_chart(csv_filepath, output_dir=None):
             unique_purposes = opup_df['Intended_Purpose'].dropna().unique()
             if len(unique_purposes) == 1:
                 purpose = unique_purposes[0]
-                # Truncate if too long
                 if len(purpose) > 50:
                     purpose = purpose[:47] + "..."
                 opup_display_names[opup] = f"{opup_short} | {purpose}"
@@ -3081,16 +3587,19 @@ def create_opup_gantt_chart(csv_filepath, output_dir=None):
         else:
             opup_display_names[opup] = opup_short
         
+        # Store for second pass
+        opup_metadata[opup] = opup_df
+        
         print(f"\nProcessing: {opup_display_names[opup]}")
         print(f"  Visits: {len(opup_df)}")
         
-        # Get overall OPUP window (min earliest, max latest)
+        # Get overall OPUP window
         earliest_start = opup_df['Earliest_Start_dt'].min()
         latest_start = opup_df['Latest_Start_dt'].max()
         latest_end = opup_df['Latest_End_dt'].max()
         
         if pd.notna(earliest_start) and pd.notna(latest_start):
-            # 1. Schedulability window (earliest to latest start)
+            # Add windows first (background)
             gantt_data.append(dict(
                 Task=opup_display_names[opup],
                 Start=earliest_start,
@@ -3099,17 +3608,9 @@ def create_opup_gantt_chart(csv_filepath, output_dir=None):
                 Description=f'OPUP can be scheduled anytime in this window'
             ))
             
-            # 2. Execution window (latest start to latest end)
-            if pd.notna(latest_end):
-                gantt_data.append(dict(
-                    Task=opup_display_names[opup],
-                    Start=latest_start,
-                    Finish=latest_end,
-                    Resource='Execution Window',
-                    Description=f'Must complete by this time'
-                ))
-        
-        # 3. Individual visit execution times
+    # Second pass: Add scheduled visits on top
+    for opup in opups:
+        opup_df = opup_metadata[opup]
         for _, visit in opup_df.iterrows():
             if pd.notna(visit['Start_dt']) and 'Duration' in visit and pd.notna(visit['Duration']):
                 visit_end = visit['Start_dt'] + timedelta(seconds=visit['Duration'])
@@ -3122,62 +3623,140 @@ def create_opup_gantt_chart(csv_filepath, output_dir=None):
                     Resource='Scheduled Visit',
                     Description=f'Visit {visit_id}'
                 ))
-    
+        
     if not gantt_data:
         print("❌ No valid scheduling data found")
         return None
     
-    # Create figure
-    fig = ff.create_gantt(
-        gantt_data,
-        colors={
-            'Schedulability Window': 'rgba(52, 152, 219, 0.3)',  # Light blue
-            'Execution Window': 'rgba(241, 196, 15, 0.4)',        # Light yellow
-            'Scheduled Visit': 'rgba(46, 204, 113, 0.8)'          # Green
-        },
-        index_col='Resource',
-        show_colorbar=True,
-        group_tasks=True,
-        showgrid_x=True,
-        showgrid_y=True,
-        title='OPUP Schedulability Timeline (Ordered by Start Time)',
-        height=400 + len(opups) * 80  # Increased height per OPUP for longer labels
-    )
-    
-    # Update layout
-    fig.update_layout(
-        xaxis_title="Date/Time",
-        yaxis_title="OPUP (Chronological Order)",
-        font=dict(size=11),
-        hovermode='closest',
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        xaxis=dict(
-            gridcolor='lightgray',
-            showgrid=True,
-            tickformat='%Y-%m-%d\n%H:%M',
-            dtick=86400000.0  # 1 day in milliseconds
-        ),
-        yaxis=dict(
-            gridcolor='lightgray',
-            showgrid=True,
-            tickfont=dict(size=10)  # Smaller font for longer labels
-        ),
-        legend=dict(
-            title="Legend",
-            orientation="v",
-            yanchor="top",
-            y=1,
-            xanchor="left",
-            x=1.01
-        ),
-        margin=dict(l=300)  # Increase left margin for longer OPUP names
-    )
+    # Create figure manually for better control over z-ordering
+    from plotly import graph_objects as go
+
+    fig = go.Figure()
+
+    # Create a mapping of OPUP names to y-axis positions
+    opup_to_y = {opup_display_names[opup]: idx for idx, opup in enumerate(opups)}
+
+    # Sort gantt_data by Resource type to control drawing order
+    # Order: Schedulability Window (bottom), Scheduled Visit (top)
+    resource_order = {'Schedulability Window': 0, 'Scheduled Visit': 1}
+    gantt_data_sorted = sorted(gantt_data, key=lambda x: resource_order.get(x['Resource'], 2))
+
+    # Color mapping
+    color_map = {
+        'Schedulability Window': 'rgba(52, 152, 219, 0.3)',  # Light blue
+        'Scheduled Visit': 'rgba(46, 204, 113, 0.9)'          # Green (more opaque)
+    }
+
+    # Track which resources we've added to legend
+    legend_added = set()
+
+    # Plot all bars
+    for item in gantt_data_sorted:
+        task = item['Task']
+        start = item['Start']
+        finish = item['Finish']
+        resource = item['Resource']
+        description = item.get('Description', '')
+        
+        y_pos = opup_to_y.get(task, 0)
+        color = color_map.get(resource, 'gray')
+        
+        # Determine if this should show in legend
+        show_legend = resource not in legend_added
+        if show_legend:
+            legend_added.add(resource)
+        
+        # Add the bar as a shape for better control
+        fig.add_trace(go.Scatter(
+            x=[start, finish, finish, start, start],
+            y=[y_pos - 0.4, y_pos - 0.4, y_pos + 0.4, y_pos + 0.4, y_pos - 0.4],
+            fill='toself',
+            fillcolor=color,
+            line=dict(width=1, color='rgba(0,0,0,0.3)' if resource == 'Scheduled Visit' else 'rgba(0,0,0,0.1)'),
+            mode='lines',
+            name=resource,
+            legendgroup=resource,
+            showlegend=show_legend,
+            hovertemplate=f'<b>{task}</b><br>' +
+                        f'{resource}<br>' +
+                        f'Start: {start}<br>' +
+                        f'End: {finish}<br>' +
+                        f'{description}<br>' +
+                        '<extra></extra>',
+            # Force Scheduled Visits on top with explicit ordering
+            legendrank=resource_order.get(resource, 3)
+        ))
+
+        # Update layout
+        fig.update_layout(
+            title='OPUP Schedulability Timeline (Ordered by Start Time)',
+            xaxis_title="Date/Time",
+            yaxis_title="OPUP (Chronological Order)",
+            height=400 + len(opups) * 80,
+            font=dict(size=11),
+            hovermode='closest',
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            showlegend=True,
+            legend=dict(
+                title="Legend",
+                orientation="v",
+                yanchor="top",
+                y=1,
+                xanchor="left",
+                x=1.01
+            ),
+            margin=dict(l=300),
+            xaxis=dict(
+                gridcolor='lightgray',
+                showgrid=True,
+                tickformat='%Y-%m-%d<br>%H:%M',
+                dtick=86400000.0
+            ),
+            yaxis=dict(
+                gridcolor='lightgray',
+                showgrid=True,
+                tickfont=dict(size=10),
+                tickmode='array',
+                tickvals=list(range(len(opups))),
+                ticktext=[opup_display_names[opup] for opup in opups],
+                range=[-0.5, len(opups) - 0.5]
+            )
+        )    
+        
+        # Update layout
+        fig.update_layout(
+            xaxis_title="Date/Time",
+            yaxis_title="OPUP (Chronological Order)",
+            font=dict(size=11),
+            hovermode='closest',
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            xaxis=dict(
+                gridcolor='lightgray',
+                showgrid=True,
+                tickformat='%Y-%m-%d\n%H:%M',
+                dtick=86400000.0  # 1 day in milliseconds
+            ),
+            yaxis=dict(
+                gridcolor='lightgray',
+                showgrid=True,
+                tickfont=dict(size=10)  # Smaller font for longer labels
+            ),
+            legend=dict(
+                title="Legend",
+                orientation="v",
+                yanchor="top",
+                y=1,
+                xanchor="left",
+                x=1.01
+            ),
+            margin=dict(l=300)  # Increase left margin for longer OPUP names
+        )
     
     # Add annotations
     fig.add_annotation(
         text="<b>Schedulability Window</b>: OPUP can start anytime in this range<br>" +
-             "<b>Execution Window</b>: Latest possible execution period<br>" +
              "<b>Scheduled Visit</b>: Actual scheduled visit execution<br>" +
              "<i>OPUPs ordered from earliest to latest start time</i>",
         xref="paper", yref="paper",
@@ -3361,24 +3940,22 @@ def create_detailed_opup_schedule(csv_filepath, output_dir=None):
     for idx, opup in enumerate(opups):
         opup_df = df[df['OPUP_Source'] == opup].copy()
         opup_df = opup_df.sort_values('Start_dt')
-        row_num = idx + 2
-        
-        # Use a consistent y-position (0-1 range) for better alignment visualization
-        y_position = 0.5
-        bar_height = 0.3
+        row_num = idx + 2  # Row 1 = overall, Row 2+ = individual OPUPs
         
         for visit_idx, (_, visit) in enumerate(opup_df.iterrows()):
             if pd.notna(visit['Start_dt']) and pd.notna(visit.get('Duration')):
                 start = visit['Start_dt']
                 end = start + timedelta(seconds=visit['Duration'])
                 
-                # Calculate y position based on visit index
-                y_base = visit_idx
+                # Calculate y position - each visit gets its own row
+                # Add small spacing between visits
+                y_base = visit_idx * 1.2  # Increased spacing for clarity
+                bar_height = 0.8
                 
                 # Visit bar
                 fig.add_trace(go.Scatter(
                     x=[start, end, end, start, start],
-                    y=[y_base, y_base, y_base+0.8, y_base+0.8, y_base],
+                    y=[y_base, y_base, y_base + bar_height, y_base + bar_height, y_base],
                     fill='toself',
                     fillcolor=colors[idx % len(colors)],
                     line=dict(color='black', width=1),
@@ -3386,9 +3963,9 @@ def create_detailed_opup_schedule(csv_filepath, output_dir=None):
                     name=visit.get('Visit_ID', 'N/A'),
                     showlegend=False,
                     hovertext=f"Visit: {visit.get('Visit_ID', 'N/A')}<br>" +
-                              f"Start: {start.strftime('%Y-%m-%d %H:%M:%S')}<br>" +
-                              f"Filter: {visit.get('WFI_Optical_Element', 'N/A')}<br>" +
-                              f"Duration: {visit.get('Duration', 'N/A')}s",
+                            f"Start: {start.strftime('%Y-%m-%d %H:%M:%S')}<br>" +
+                            f"Filter: {visit.get('WFI_Optical_Element', 'N/A')}<br>" +
+                            f"Duration: {visit.get('Duration', 'N/A')}s",
                     hoverinfo='text'
                 ), row=row_num, col=1)
                 
@@ -3396,9 +3973,9 @@ def create_detailed_opup_schedule(csv_filepath, output_dir=None):
                 if pd.notna(visit['Earliest_Start_dt']) and pd.notna(visit['Latest_Start_dt']):
                     fig.add_trace(go.Scatter(
                         x=[visit['Earliest_Start_dt'], visit['Latest_Start_dt']],
-                        y=[y_base+0.4, y_base+0.4],
+                        y=[y_base + bar_height/2, y_base + bar_height/2],  # Center of bar
                         mode='lines',
-                        line=dict(color='orange', width=2, dash='dot'),
+                        line=dict(color='orange', width=3, dash='dot'),
                         showlegend=False,
                         hovertext=f"Schedulability window: {visit['Earliest_Start_dt'].strftime('%Y-%m-%d %H:%M')} to {visit['Latest_Start_dt'].strftime('%Y-%m-%d %H:%M')}"
                     ), row=row_num, col=1)
@@ -3406,23 +3983,23 @@ def create_detailed_opup_schedule(csv_filepath, output_dir=None):
                 # Add vertical line at actual start time for clarity
                 fig.add_trace(go.Scatter(
                     x=[start, start],
-                    y=[y_base, y_base+0.8],
+                    y=[y_base, y_base + bar_height],
                     mode='lines',
                     line=dict(color='darkgreen', width=2),
                     showlegend=False,
                     hovertext=f"Start: {start.strftime('%Y-%m-%d %H:%M:%S')}"
                 ), row=row_num, col=1)
-    
-    # Update all x-axes to use the same range
-    for i in range(1, n_opups + 2):
-        fig.update_xaxes(
-            range=[global_min_time, global_max_time],
-            tickformat='%Y-%m-%d<br>%H:%M',
-            showgrid=True,
-            gridcolor='lightgray',
-            row=i,
-            col=1
-        )
+                
+        # Update all x-axes to use the same range
+        for i in range(1, n_opups + 2):
+            fig.update_xaxes(
+                range=[global_min_time, global_max_time],
+                tickformat='%Y-%m-%d<br>%H:%M',
+                showgrid=True,
+                gridcolor='lightgray',
+                row=i,
+                col=1
+            )
     
     # Update layout
     fig.update_layout(
@@ -3460,6 +4037,72 @@ def create_detailed_opup_schedule(csv_filepath, output_dir=None):
     print(f"   All plots aligned to common time axis: {global_min_time.strftime('%Y-%m-%d %H:%M')} to {global_max_time.strftime('%Y-%m-%d %H:%M')}\n")
     
     return str(output_html)
+
+def package_report_archive(opup_stem, output_dir, generated_files=None):
+    """
+    Bundle all generated report products into a single .tgz archive
+    for easy sharing and portability.
+
+    The archive preserves relative paths so that HTML cross-links
+    (to sky_plots/, mosaic page, sky plotter, etc.) still work
+    when extracted into a single folder.
+
+    Args:
+        opup_stem: str, the OPUP name stem (e.g. 'my_opup')
+        output_dir: Path, directory containing all generated products
+        generated_files: list of Path objects that were created
+                         (if None, auto-discovers by stem prefix)
+
+    Returns:
+        Path to the created .tgz archive, or None on failure
+    """
+    output_dir = Path(output_dir)
+    archive_name = output_dir / f"{opup_stem}_report_package.tgz"
+
+    files_to_include = []
+
+    if generated_files:
+        # Use the explicit list — only include files that actually exist
+        for fpath in generated_files:
+            fpath = Path(fpath)
+            if fpath.exists():
+                files_to_include.append(fpath)
+    else:
+        # Fallback: auto-discover anything matching the opup_stem
+        for fpath in sorted(output_dir.glob(f"{opup_stem}*")):
+            if fpath.is_file() and fpath.name != archive_name.name:
+                files_to_include.append(fpath)
+
+    # Also include sky_plots/ PNGs directory if it exists
+    sky_plots_dir = output_dir / "sky_plots"
+    if sky_plots_dir.is_dir():
+        for png_file in sorted(sky_plots_dir.glob("*.png")):
+            files_to_include.append(png_file)
+
+    if not files_to_include:
+        print("  ⚠️  No report files found to package.")
+        return None
+
+    try:
+        with tarfile.open(archive_name, 'w:gz') as tar:
+            for fpath in files_to_include:
+                arcname = fpath.relative_to(output_dir)
+                tar.add(str(fpath), arcname=str(arcname))
+
+        n_files = len(files_to_include)
+        size_mb = archive_name.stat().st_size / (1024 * 1024)
+        print(f"\n📦 Packaged {n_files} files into: {archive_name.name} ({size_mb:.1f} MB)")
+        for fpath in files_to_include:
+            rel = fpath.relative_to(output_dir)
+            fsize = fpath.stat().st_size / 1024
+            print(f"     {rel}  ({fsize:.0f} KB)")
+
+        return archive_name
+
+    except Exception as e:
+        print(f"  ⚠️  Failed to create archive: {e}")
+        return None
+    
 
 if __name__ == '__main__':
     parser = setup_parser()
