@@ -14,10 +14,14 @@ import zipfile
 import argparse
 import html as html_module
 import json
+from astropy.coordinates import SkyCoord
 
 # Columns to make first in the output CSV file (if available)
-PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA', 'DEC', 'Position_Angle', 'Off-Normal_Roll', 'WFI_SCI_TABLE', 'READFRAMES', 'WFI_Optical_Element']
+# PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA', 'DEC', 'Position_Angle', 'Off-Normal_Roll', 'WFI_SCI_TABLE', 'READFRAMES', 'WFI_Optical_Element']
 
+PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA', 'DEC', 'Position_Angle',
+                    'Off-Normal_Roll', 'Off-Normal_Roll [calc]', 'Pitch [calc]',
+                    'WFI_SCI_TABLE', 'READFRAMES', 'WFI_Optical_Element']
 #%%
 
 import matplotlib
@@ -3187,6 +3191,192 @@ def _generate_sky_plotter(opup_stem, output_dir, plotter_csv, sun_date):
         traceback.print_exc()
         return None
 
+from roman_attitude import RomanPointing
+from astropy.time import Time
+
+def get_pitch_and_roll(ra, dec, v3pa, obs_time):
+    """
+    Given the actual pointing from a visit file, compute the pitch
+    and off-nominal roll angle.
+
+    Parameters
+    ----------
+    ra : float
+        Right Ascension in degrees (V1 boresight)
+    dec : float
+        Declination in degrees (V1 boresight)
+    v3pa : float
+        V3 Position Angle in degrees (from visit file)
+    obs_time : str or datetime or astropy.Time
+        Observation time (needed for Sun position)
+
+    Returns
+    -------
+    pitch : float
+        Pitch angle in degrees. 0° = Sun perpendicular to boresight.
+        Positive = pitched away from Sun.
+    roll : float
+        Off-nominal roll in degrees. 0° = nominal (Z toward Sun).
+        This is the difference between the actual V3PA and the 
+        nominal V3PA that the spacecraft would have at roll=0.
+    sun_angle : float
+        Sun–target separation in degrees.
+    nominal_v3pa : float
+        The V3PA the spacecraft would have at nominal roll=0.
+    """
+    # 1. Create RomanPointing at the observation time
+    rp = RomanPointing(observation_date=Time(obs_time))
+
+    # 2. Point at the target with nominal roll (roll=0)
+    #    This builds the attitude matrix with Z toward the Sun
+    rp.set_target_using_radec(ra, dec, roll=0.0)
+
+    # 3. Pitch is purely a function of Sun–target geometry
+    #    (independent of roll — it only depends on RA, Dec, and date)
+    pitch = rp.get_pitch_angle()          # returns Quantity in degrees
+    sun_angle = rp.get_sun_angle()        # Sun-target separation in degrees
+
+    # 4. Get the nominal V3PA (what PA would be at roll=0)
+    nominal_v3pa = rp.get_position_angle()  # returns Quantity in degrees
+
+    # 5. Roll = difference between actual V3PA and nominal V3PA
+    #    Wrap to [-180, +180]
+    roll = (v3pa - nominal_v3pa.value + 180) % 360 - 180
+
+    return {
+        'pitch': pitch.value,
+        'roll': roll,
+        'sun_angle': sun_angle,
+        'nominal_v3pa': nominal_v3pa.value,
+        'actual_v3pa': v3pa
+    }
+
+def add_attitude_columns(df):
+    """
+    Add Sun_Angle, Pitch, and Off-Nominal_Roll columns to the DataFrame.
+    """
+    required = ['RA', 'DEC', 'Position_Angle', 'Start']
+    if not all(col in df.columns for col in required):
+        missing = [c for c in required if c not in df.columns]
+        print(f"  ⚠️  Cannot compute attitude columns — missing: {missing}")
+        return df
+    
+    try:
+        from roman_attitude import RomanPointing, get_sun_from_l2_jpl
+        from astropy.time import Time
+        from astropy.coordinates import SkyCoord
+        from astropy import units as u
+    except ImportError:
+        print("  ⚠️  roman_attitude not available — skipping attitude columns")
+        return df
+
+    sun_angles = []
+    pitches = []
+    rolls = []
+
+    for idx, row in df.iterrows():
+        if any(pd.isna(row.get(c)) for c in required):
+            sun_angles.append(None)
+            pitches.append(None)
+            rolls.append(None)
+            continue
+
+        try:
+            ra = float(row['RA'])
+            dec = float(row['DEC'])
+            v3pa = float(row['Position_Angle'])
+            start_str = str(row['Start']).strip()
+
+            obs_time = _parse_obs_time(start_str)
+            if obs_time is None:
+                sun_angles.append(None)
+                pitches.append(None)
+                rolls.append(None)
+                continue
+
+            # ── Sun position from JPL for this exact time ──
+            sun_ra, sun_dec = get_sun_from_l2_jpl(obs_time)
+            sun_coord = SkyCoord(ra=sun_ra*u.deg, dec=sun_dec*u.deg, frame='icrs')
+
+            # ── Sun angle: pure geometry ──
+            target = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame='icrs')
+            sun_angle = sun_coord.separation(target).deg
+
+            # ── Pitch ──
+            pitch_val = sun_angle - 90.0
+
+            # ── Roll: fresh RomanPointing for this exact time ──
+            rp = RomanPointing(observation_date=obs_time)
+            rp.set_target_using_radec(ra, dec, roll=0.0)
+            nominal_v3pa = rp.get_position_angle()
+            roll_val = (v3pa - nominal_v3pa.value + 180) % 360 - 180
+
+            sun_angles.append(round(sun_angle, 2))
+            pitches.append(round(pitch_val, 2))
+            rolls.append(round(roll_val, 2))
+
+        except Exception as e:
+            sun_angles.append(None)
+            pitches.append(None)
+            rolls.append(None)
+
+    df['Sun_Angle [calc]'] = sun_angles
+    df['Pitch [calc]'] = pitches
+    df['Off-Normal_Roll [calc]'] = rolls
+
+    n_computed = sum(1 for v in pitches if v is not None)
+    n_nonzero_pitch = sum(1 for v in pitches if v is not None and abs(v) > 0.1)
+    print(f"  🧭 Computed attitude for {n_computed}/{len(df)} rows ({n_nonzero_pitch} with |pitch| > 0.1°)")
+
+    valid_pitches = [v for v in pitches if v is not None]
+    if valid_pitches:
+        print(f"  📐 Pitch range: [{min(valid_pitches):.2f}°, {max(valid_pitches):.2f}°]")
+    valid_sun = [v for v in sun_angles if v is not None]
+    if valid_sun:
+        print(f"  ☀️  Sun angle range: [{min(valid_sun):.2f}°, {max(valid_sun):.2f}°]")
+
+    return df
+
+
+def _parse_obs_time(start_str):
+    """
+    Parse a Start time string from the visit file into an astropy Time object.
+    Handles formats like '2026-276-13:00:51 TAI' and '2026-10-03T13:00:51'.
+    
+    Args:
+        start_str: str, time string from the Start column
+    
+    Returns:
+        astropy.time.Time or None
+    """
+    from astropy.time import Time
+    from datetime import datetime, timezone, timedelta
+
+    # Strip time scale suffix
+    clean = re.sub(r'\s*(TAI|UTC|TDB|TT)\s*$', '', start_str, flags=re.I).strip()
+
+    # Try YYYY-DDD-HH:MM:SS (day of year)
+    doy_match = re.match(r'^(\d{4})-(\d{1,3})(?:-(\d{2}:\d{2}:\d{2}))?$', clean)
+    if doy_match:
+        year = int(doy_match.group(1))
+        doy = int(doy_match.group(2))
+        time_part = doy_match.group(3) or '00:00:00'
+        if 1 <= doy <= 366:
+            dt = datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=doy - 1)
+            h, m, s = [int(x) for x in time_part.split(':')]
+            dt = dt.replace(hour=h, minute=m, second=s)
+            return Time(dt)
+
+    # Try standard ISO formats
+    for fmt in ('%Y-%m-%d', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S'):
+        try:
+            dt = datetime.strptime(clean, fmt).replace(tzinfo=timezone.utc)
+            return Time(dt)
+        except ValueError:
+            continue
+
+    return None
+
 def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
     """
     Generate both the detailed OPUP HTML report and the sky plotter visualization.
@@ -3221,8 +3411,12 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
     # ── Step 1: Parse OPUP ──
     print("Step 1: Parsing OPUP...")
     opup_info = parse_OPUP(opup_filepath)
-    opup_info = prioritize_columns(opup_info, PRIORITY_COLUMNS)
     
+    # ── Step 1b: Add attitude columns ──     
+    print("\n🧭 Computing spacecraft attitude (pitch & roll)...")
+    opup_info = add_attitude_columns(opup_info)
+    opup_info = prioritize_columns(opup_info, PRIORITY_COLUMNS)
+
     # ── Step 2: Extract date for Sun position ──
     sun_date = _parse_sun_date(opup_info)
     
