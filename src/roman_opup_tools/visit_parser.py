@@ -1,6 +1,9 @@
 # Authors:
-# David Morgan
 # Maxime Rizzo
+# NASA GSFC, 2026
+
+# Contributors:
+# David Morgan
 
 #%%
 import os
@@ -15,10 +18,12 @@ import argparse
 import html as html_module
 import json
 from astropy.coordinates import SkyCoord
+from roman_opup_tools import roman_attitude
+from roman_visit_viewer.roman_visit_viewer import VisitFileParser, plot_manager
+import shutil
+import matplotlib
 
 # Columns to make first in the output CSV file (if available)
-# PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA', 'DEC', 'Position_Angle', 'Off-Normal_Roll', 'WFI_SCI_TABLE', 'READFRAMES', 'WFI_Optical_Element']
-
 PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA', 'DEC', 'Position_Angle',
                     'Off-Normal_Roll', 'Off-Normal_Roll [calc]', 'Pitch [calc]',
                     'WFI_SCI_TABLE', 'READFRAMES', 'WFI_Optical_Element']
@@ -35,11 +40,8 @@ def generate_sky_plot_pngs(opup_filepath, output_dir, df):
     Returns:
         dict: mapping visit_filename (str) -> png_relative_path (str)
     """
-    import matplotlib
+    
     matplotlib.use('Agg')
-
-    from roman_visit_viewer import VisitFileParser, plot_manager
-    import shutil
 
     output_dir = Path(output_dir)
     png_dir = output_dir / "sky_plots"
@@ -67,16 +69,15 @@ def generate_sky_plot_pngs(opup_filepath, output_dir, df):
 
             # 2) Parse and plot
             parser = VisitFileParser(str(tmp_vst))
-            plot_manager(parser, exp_num=1, savefig=True)
+            plot_manager(parser, exp_num=1, output_dir=png_dir)
 
             # 3) plot_manager saves to CWD as "<name>_all.png"
             #    Move it into our sky_plots directory
-            expected_png = Path(vst_name.replace('.vst', '_all.png'))
-            if expected_png.exists():
-                dest = png_dir / expected_png.name
-                shutil.move(str(expected_png), str(dest))
-                visit_png_map[vst_name] = f"sky_plots/{expected_png.name}"
-                print(f"  🔭 Generated sky plot: {dest}")
+            vst_stem = vst_name.replace('.vst', '')
+            for png_file in png_dir.glob(f"{vst_stem}*.png"):
+                visit_png_map[vst_name] = str(png_file)
+                print(f"  🔭 Generated sky plot: {png_file}")
+                break
 
             # Clean up temp .vst
             tmp_vst.unlink(missing_ok=True)
@@ -3148,50 +3149,40 @@ def _parse_sun_date(opup_info):
 def _generate_sky_plotter(opup_stem, output_dir, plotter_csv, sun_date):
     """Generate the interactive sky plotter HTML via roman_plotter."""
     sky_plotter_html = output_dir / f"{opup_stem}_skymap.html"
-    
-    script_dir = Path(__file__).parent
-    roman_plotter_path = script_dir / "roman_plotter.py"
-    
-    if not roman_plotter_path.exists():
-        print(f"  ⚠️  roman_plotter.py not found at {roman_plotter_path}")
-        return None
-    
+
     try:
-        import sys
-        if str(script_dir) not in sys.path:
-            sys.path.insert(0, str(script_dir))
-        import roman_plotter
-        
-        import json
+        from roman_opup_tools import roman_plotter
+
         plotter_data = pd.read_csv(plotter_csv)
         data_json = plotter_data.to_json(orient='records')
         preloaded_datasets = [{
             'fileName': plotter_csv.name,
             'data_json': data_json
         }]
-        
+
         sun_position = roman_plotter.get_sun_position(sun_date)
         print(f"  ☀️  Sun RA={sun_position['ra']:.2f}°, Dec={sun_position['dec']:.2f}° "
               f"(Galactic: l={sun_position['l']:.2f}°, b={sun_position['b']:.2f}°)")
-        
+
         html_content = roman_plotter.generate_html(
             preloaded_datasets=preloaded_datasets,
             sun_position=sun_position
         )
-        
+
         with open(sky_plotter_html, 'w', encoding='utf-8') as f:
             f.write(html_content)
-        
+
         print(f"  ✅ Generated sky plotter: {sky_plotter_html}")
         return sky_plotter_html
-        
+
     except Exception as e:
         print(f"  ⚠️  Could not generate sky plotter: {e}")
         import traceback
         traceback.print_exc()
         return None
+    
 
-from roman_attitude import RomanPointing
+from roman_opup_tools.roman_attitude import RomanPointing
 from astropy.time import Time
 
 def get_pitch_and_roll(ra, dec, v3pa, obs_time):
@@ -3262,7 +3253,7 @@ def add_attitude_columns(df):
         return df
     
     try:
-        from roman_attitude import RomanPointing, get_sun_from_l2_jpl
+        from roman_opup_tools.roman_attitude import RomanPointing, get_sun_from_l2_jpl
         from astropy.time import Time
         from astropy.coordinates import SkyCoord
         from astropy import units as u
