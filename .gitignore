@@ -3,3 +3,15 @@
 __pycache__/roman_attitude.cpython-312.pyc
 __pycache__/roman_plotter.cpython-312.pyc
 __pycache__/roman_visit_viewer.cpython-312.pyc
+.DS_Store
+.gitignore
+src/roman_opup_tools/__pycache__/roman_plotter.cpython-312.pyc
+.gitignore
+src/roman_opup_tools.egg-info/dependency_links.txt
+src/roman_opup_tools.egg-info/requires.txt
+.gitignore
+src/roman_opup_tools.egg-info/SOURCES.txt
+src/roman_opup_tools.egg-info/PKG-INFO
+src/roman_opup_tools/__pycache__/roman_attitude.cpython-312.pyc
+src/roman_opup_tools/__pycache__/__init__.cpython-312.pyc
+src/roman_opup_tools.egg-info/top_level.txt
