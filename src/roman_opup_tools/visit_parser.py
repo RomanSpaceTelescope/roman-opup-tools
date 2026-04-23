@@ -24,7 +24,7 @@ import shutil
 import matplotlib
 
 # Columns to make first in the output CSV file (if available)
-PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA', 'DEC', 'Position_Angle',
+PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA_V1 [calc]', 'DEC_V1 [calc]', 'V3PA_V1 [calc]', 'RA_WFI_CEN [calc]', 'DEC_WFI_CEN [calc]', 'V3PA_WFI_CEN [calc]',
                     'Off-Normal_Roll', 'Off-Normal_Roll [calc]', 'Pitch [calc]',
                     'WFI_SCI_TABLE', 'READFRAMES', 'WFI_Optical_Element']
 #%%
@@ -171,7 +171,26 @@ def precompute_wfi_footprints(df):
                     [round(r, 7), round(d, 7)]
                     for r, d in zip(ra_corners, dec_corners)
                 ]
-
+            # ── Extract CGI aperture corners ──
+            try:
+                cgi_aper = RSIAF['CGI_CEN']
+                cgi_aper.set_attitude_matrix(att_mat)
+                ra_corners = []
+                dec_corners = []
+                for iv in range(1, 5):
+                    x_idl = getattr(cgi_aper, f'XIdlVert{iv}')
+                    y_idl = getattr(cgi_aper, f'YIdlVert{iv}')
+                    ra_sky, dec_sky = cgi_aper.idl_to_sky(x_idl, y_idl)
+                    ra_corners.append(float(ra_sky))
+                    dec_corners.append(float(dec_sky))
+                ra_corners.append(ra_corners[0])
+                dec_corners.append(dec_corners[0])
+                visit_fp['cgi'] = [
+                    [round(r, 7), round(d, 7)]
+                    for r, d in zip(ra_corners, dec_corners)
+                ]
+            except Exception:
+                pass  # CGI aperture not available in this SIAF version
             # ── 6. Extract guide window positions ──
             # Columns: TRK_USE_GWxx ("GUIDE" or "SKY_FIXED")
             #          TRK_H_GWxx, TRK_V_GWxx (FGS frame coords)
@@ -221,6 +240,93 @@ def precompute_wfi_footprints(df):
 
     print(f"  ✅ Computed footprints for {len(footprints)}/{len(unique_rows)} exposures")
     return footprints
+
+def add_pointing_columns(df):
+    """
+    Compute RA, Dec, V3PA at V1 boresight and at WFI_CEN from the 
+    TAR_Q*_ECI2BCS quaternion columns, and add them to the DataFrame.
+    
+    New columns added:
+        RA [calc]              - V1 boresight RA (degrees)
+        DEC [calc]             - V1 boresight Dec (degrees)
+        V3PA [calc]            - V3 position angle at V1 (degrees)
+        RA_WFI_CEN [calc]     - RA at WFI_CEN aperture (degrees)
+        DEC_WFI_CEN [calc]    - Dec at WFI_CEN aperture (degrees)
+        V3PA_WFI_CEN [calc]   - V3PA at WFI_CEN aperture (degrees)
+    """
+    have_quat = all(c in df.columns for c in QUAT_COLS)
+    if not have_quat:
+        print("  ⚠️  Quaternion columns not found — skipping pointing columns")
+        return df
+
+    try:
+        import pysiaf
+        import astropy.units as u
+        RSIAF = pysiaf.Siaf('Roman')
+    except ImportError:
+        print("  ⚠️  pysiaf not installed — skipping pointing columns")
+        return df
+
+    ra_v1_list = []
+    dec_v1_list = []
+    v3pa_v1_list = []
+    ra_wfi_list = []
+    dec_wfi_list = []
+    v3pa_wfi_list = []
+
+    for _, row in df.iterrows():
+        try:
+            q1 = float(row['TAR_Q1_ECI2BCS'])
+            q2 = float(row['TAR_Q2_ECI2BCS'])
+            q3 = float(row['TAR_Q3_ECI2BCS'])
+            q4 = float(row['TAR_Q4_ECI2BCS'])
+
+            if any(np.isnan(v) for v in [q1, q2, q3, q4]):
+                raise ValueError("NaN quaternion")
+
+            # Quaternion → RA, Dec, V3PA at V1
+            ra_v1, dec_v1, v3pa = roman_attitude.quat_to_radec_pa(q1, q2, q3, q4)
+
+            # Build attitude matrix
+            att_mat = pysiaf.rotations.attitude_matrix(0, 0, ra_v1, dec_v1, v3pa)
+
+            # WFI_CEN sky position
+            wfi_cen = RSIAF['WFI_CEN']
+            ra_wfi, dec_wfi = pysiaf.rotations.tel_to_sky(
+                att_mat, wfi_cen.V2Ref, wfi_cen.V3Ref
+            )
+            ra_wfi = float(ra_wfi.to(u.deg).value) if hasattr(ra_wfi, 'to') else float(ra_wfi)
+            dec_wfi = float(dec_wfi.to(u.deg).value) if hasattr(dec_wfi, 'to') else float(dec_wfi)
+            v3pa_wfi = pysiaf.rotations.posangle(att_mat, wfi_cen.V2Ref, wfi_cen.V3Ref)
+            v3pa_wfi = float(v3pa_wfi.to(u.deg).value) if hasattr(v3pa_wfi, 'to') else float(v3pa_wfi)
+
+            ra_v1_list.append(round(ra_v1, 6))
+            dec_v1_list.append(round(dec_v1, 6))
+            v3pa_v1_list.append(round(v3pa, 4))
+            ra_wfi_list.append(round(ra_wfi, 6))
+            dec_wfi_list.append(round(dec_wfi, 6))
+            v3pa_wfi_list.append(round(v3pa_wfi, 4))
+
+        except Exception:
+            ra_v1_list.append(None)
+            dec_v1_list.append(None)
+            v3pa_v1_list.append(None)
+            ra_wfi_list.append(None)
+            dec_wfi_list.append(None)
+            v3pa_wfi_list.append(None)
+
+    df['RA_V1 [calc]'] = ra_v1_list
+    df['DEC_V1 [calc]'] = dec_v1_list
+    df['V3PA_V1 [calc]'] = v3pa_v1_list
+    df['RA_WFI_CEN [calc]'] = ra_wfi_list
+    df['DEC_WFI_CEN [calc]'] = dec_wfi_list
+    df['V3PA_WFI_CEN [calc]'] = v3pa_wfi_list
+
+    n_computed = sum(1 for v in ra_v1_list if v is not None)
+    print(f"  📐 Computed V1 + WFI_CEN pointing for {n_computed}/{len(df)} rows")
+
+    return df
+
 
 import matplotlib
 matplotlib.use('Agg')  # non-interactive backend for batch generation
@@ -1296,13 +1402,9 @@ def split_df_columns(df, columns_to_split):
     return df_1, df_2
 
 def prioritize_columns(df, priority_columns):
-
-    # Filtering out columns that are not available in the given DataFrame
-    priotiry_cols = set(priority_columns) - set(df.columns)
-
-    # Re-order columns in the data frame to prioritize the given columns
-    new_order = priority_columns + [col for col in df.columns if col not in priority_columns]
-
+    # Only keep priority columns that actually exist in the DataFrame
+    existing_priority = [col for col in priority_columns if col in df.columns]
+    new_order = existing_priority + [col for col in df.columns if col not in existing_priority]
     return df[new_order]
 
 def find_nontgz_parent(folderpath):
@@ -1849,48 +1951,42 @@ def get_aladin_javascript(wfi_footprints_json):
         aladin.setImageSurvey(SURVEYS[surveyIdx]);
         document.getElementById('aladin-survey-label').textContent = SURVEY_NAMES[surveyIdx];
     }}
-function toggleSCALabels() {{
-        showLabels = !showLabels;
-        for (const layers of Object.values(activeLayers)) {{
-            try {{
-                if (showLabels) {{
-                    if (!layers._catalogVisible) {{
-                        aladin.addCatalog(layers.catalog);
-                        layers._catalogVisible = true;
-                    }}
-                }} else {{
-                    aladin.removeLayer(layers.catalog);
-                    layers._catalogVisible = false;
-                }}
-            }} catch(e) {{}}
+    
+    
+    function redrawAll() {{
+        const savedKeys = {{}};
+        for (const [fpKey, layers] of Object.entries(activeLayers)) {{
+            savedKeys[fpKey] = layers.info;
         }}
+        clearAllFootprints();
+        const savedIdx = visitColorIdx;
+        visitColorIdx = 0;
+        for (const [fpKey, info] of Object.entries(savedKeys)) {{
+            const row = document.querySelector('tr[data-fp-key="' + fpKey + '"]');
+            const visitId = row ? (row.dataset.visitId || '') : '';
+            const sciId   = row ? (row.dataset.sciId || '') : '';
+            addFootprint(fpKey, info.ra, info.dec, info.pa, visitId, sciId);
+        }}
+        updateInfoBar();
+    }}
+
+    function toggleSCALabels() {{
+        showLabels = !showLabels;
         document.getElementById('label-toggle-btn').style.opacity = showLabels ? 1 : 0.4;
+        redrawAll();
     }}
 
     function toggleGuideStars() {{
         showGuideStars = !showGuideStars;
-        for (const layers of Object.values(activeLayers)) {{
-            if (!layers.gsCatalog) continue;
-            try {{
-                if (showGuideStars) {{
-                    if (!layers._gsVisible) {{
-                        aladin.addCatalog(layers.gsCatalog);
-                        layers._gsVisible = true;
-                    }}
-                }} else {{
-                    aladin.removeLayer(layers.gsCatalog);
-                    layers._gsVisible = false;
-                }}
-            }} catch(e) {{}}
-        }}
         document.getElementById('gs-toggle-btn').style.opacity = showGuideStars ? 1 : 0.4;
+        redrawAll();
     }}
     
     function removeFootprint(fpKey) {{
         if (!activeLayers[fpKey]) return;
         try {{ aladin.removeLayer(activeLayers[fpKey].overlay); }} catch(e) {{}}
-        try {{ aladin.removeLayer(activeLayers[fpKey].catalog); }} catch(e) {{}}
-        try {{ if (activeLayers[fpKey].gsCatalog) aladin.removeLayer(activeLayers[fpKey].gsCatalog); }} catch(e) {{}}
+        try {{ if (activeLayers[fpKey].labelOverlay) aladin.removeLayer(activeLayers[fpKey].labelOverlay); }} catch(e) {{}}
+        try {{ if (activeLayers[fpKey].gsOverlay) aladin.removeLayer(activeLayers[fpKey].gsOverlay); }} catch(e) {{}}
         delete activeLayers[fpKey];
         const row = document.querySelector('tr[data-fp-key="' + fpKey + '"]');
         if (row) row.classList.remove('aladin-active');
@@ -1900,8 +1996,8 @@ function toggleSCALabels() {{
     function clearAllFootprints() {{
         for (const fpKey of Object.keys(activeLayers)) {{
             try {{ aladin.removeLayer(activeLayers[fpKey].overlay); }} catch(e) {{}}
-            try {{ aladin.removeLayer(activeLayers[fpKey].catalog); }} catch(e) {{}}
-            try {{ if (activeLayers[fpKey].gsCatalog) aladin.removeLayer(activeLayers[fpKey].gsCatalog); }} catch(e) {{}}
+            try {{ if (activeLayers[fpKey].labelOverlay) aladin.removeLayer(activeLayers[fpKey].labelOverlay); }} catch(e) {{}}
+            try {{ if (activeLayers[fpKey].gsOverlay) aladin.removeLayer(activeLayers[fpKey].gsOverlay); }} catch(e) {{}}
         }}
         activeLayers = {{}};
         visitColorIdx = 0;
@@ -1982,105 +2078,99 @@ function toggleSCALabels() {{
         const visitColor = VISIT_COLORS[visitColorIdx % VISIT_COLORS.length];
         visitColorIdx++;
 
-        // SCA overlay
+        // Layer 1: SCA polygons (bottom)
         const overlay = A.graphicOverlay({{ color: visitColor, lineWidth: 2 }});
         aladin.addOverlay(overlay);
 
-        // SCA labels + boresight markers
-        const catalog = A.catalog({{ shape: 'circle', sourceSize: 8, color: '#f1c40f' }});
-        aladin.addCatalog(catalog);
-        if (!showLabels) catalog.hide();
+        // Layer 2: SCA labels + boresight markers (middle, on top of polygons)
+        const labelOverlay = showLabels ? A.graphicOverlay({{ color: '#f1c40f', lineWidth: 1 }}) : null;
+        if (labelOverlay) aladin.addOverlay(labelOverlay);
 
-        // Guide star catalog (separate for independent toggling)
-        const gsCatalog = A.catalog({{ shape: 'circle', sourceSize: 14, color: '#f1c40f' }});
-        aladin.addCatalog(gsCatalog);
-        if (!showGuideStars) gsCatalog.hide();
+        // Layer 3: Guide stars (top)
+        const gsOverlay = showGuideStars ? A.graphicOverlay({{ color: '#f1c40f', lineWidth: 2 }}) : null;
+        if (gsOverlay) aladin.addOverlay(gsOverlay);
 
         if (fp && fp.scas) {{
-            // Draw SCA polygons
             for (const [scaName, corners] of Object.entries(fp.scas)) {{
+                // Filled polygon
                 overlay.add(A.polygon(corners, {{
                     color: visitColor, lineWidth: 1.5,
                     fill: true, fillColor: visitColor, opacity: 0.08
                 }}));
+                // Outline
                 overlay.add(A.polygon(corners, {{
                     color: visitColor, lineWidth: 2, fill: false
                 }}));
-                const cRa  = corners.reduce((s,c) => s + c[0], 0) / corners.length;
-                const cDec = corners.reduce((s,c) => s + c[1], 0) / corners.length;
-                const shortName = scaName.replace('_FULL','').replace('WFI','SCA');
-                catalog.addSources([A.source(cRa, cDec, {{
-                    name: shortName, popupTitle: scaName,
-                    popupDesc: label + '<br>RA ' + cRa.toFixed(5) + '\\u00b0  Dec ' + cDec.toFixed(5) + '\\u00b0'
-                }})]);
-            }}
-            // V1 boresight
-            if (fp.ra && fp.dec) {{
-                catalog.addSources([A.source(fp.ra, fp.dec, {{
-                    name: '\\u271b V1', popupTitle: 'V1 Boresight (' + label + ')',
-                    popupDesc: 'RA ' + fp.ra.toFixed(5) + '\\u00b0<br>Dec ' + fp.dec.toFixed(5) +
-                               '\\u00b0<br>PA(V3) ' + fp.pa.toFixed(2) + '\\u00b0'
-                }})]);
-            }}
-            // WFI_CEN
-            if (fp.ra_cen && fp.dec_cen) {{
-                catalog.addSources([A.source(fp.ra_cen, fp.dec_cen, {{
-                    name: '\\u271b WFI', popupTitle: 'WFI Center (' + label + ')',
-                    popupDesc: 'RA ' + fp.ra_cen.toFixed(5) + '\\u00b0<br>Dec ' + fp.dec_cen.toFixed(5) + '\\u00b0'
-                }})]);
+
+                // SCA label marker (small circle at centroid)
+                if (labelOverlay) {{
+                    const cRa  = corners.reduce((s,c) => s + c[0], 0) / corners.length;
+                    const cDec = corners.reduce((s,c) => s + c[1], 0) / corners.length;
+                    labelOverlay.add(A.circle(cRa, cDec, 0.001, {{
+                        color: '#f1c40f', lineWidth: 1
+                    }}));
+                }}
             }}
 
-            // ── Guide stars ──
-            // GUIDE = yellow filled circle, SKY_FIXED = grey open circle
-            if (fp.guide_stars && fp.guide_stars.length > 0) {{
+            // ── CGI aperture (magenta) ──
+            if (fp.cgi) {{
+                overlay.add(A.polygon(fp.cgi, {{
+                    color: '#ff00ff', lineWidth: 1.5,
+                    fill: true, fillColor: '#ff00ff', opacity: 0.06
+                }}));
+                overlay.add(A.polygon(fp.cgi, {{
+                    color: '#ff00ff', lineWidth: 2, fill: false
+                }}));
+                if (labelOverlay) {{
+                    const cgiRa  = fp.cgi.reduce((s,c) => s + c[0], 0) / fp.cgi.length;
+                    const cgiDec = fp.cgi.reduce((s,c) => s + c[1], 0) / fp.cgi.length;
+                    labelOverlay.add(A.circle(cgiRa, cgiDec, 0.001, {{
+                        color: '#ff00ff', lineWidth: 1
+                    }}));
+                }}
+            }}
+            
+            // V1 boresight marker
+            if (fp.ra && fp.dec) {{
+                const boresightOverlay = labelOverlay || overlay;
+                boresightOverlay.add(A.circle(fp.ra, fp.dec, 0.002, {{
+                    color: '#ffffff', lineWidth: 2
+                }}));
+            }}
+
+            // WFI_CEN marker
+            if (fp.ra_cen && fp.dec_cen) {{
+                const cenOverlay = labelOverlay || overlay;
+                cenOverlay.add(A.circle(fp.ra_cen, fp.dec_cen, 0.002, {{
+                    color: '#f1c40f', lineWidth: 2
+                }}));
+            }}
+
+            // Guide stars
+            if (fp.guide_stars && fp.guide_stars.length > 0 && gsOverlay) {{
                 for (const gs of fp.guide_stars) {{
                     const isGuide = (gs.mode === 'GUIDE');
                     const gsColor = isGuide ? '#f1c40f' : '#7f8c8d';
-                    const gsSymbol = isGuide ? '\\u2605' : '\\u25cb';
-                    const gsLabel = gsSymbol + ' GW' + String(gs.sca).padStart(2,'0');
-
-                    // Draw a circle on the overlay for visibility
-                    overlay.add(A.circle(gs.ra, gs.dec, 0.003, {{
+                    gsOverlay.add(A.circle(gs.ra, gs.dec, 0.003, {{
                         color: gsColor, lineWidth: isGuide ? 2.5 : 1.5
                     }}));
-
-                    gsCatalog.addSources([A.source(gs.ra, gs.dec, {{
-                        name: gsLabel,
-                        popupTitle: (isGuide ? 'Guide Star' : 'Sky Fixed') + ' \\u2014 SCA ' + gs.sca,
-                        popupDesc: label +
-                                   '<br>Mode: <b>' + gs.mode + '</b>' +
-                                   '<br>SCA: WFI' + String(gs.sca).padStart(2,'0') +
-                                   '<br>RA ' + gs.ra.toFixed(5) + '\\u00b0' +
-                                   '<br>Dec ' + gs.dec.toFixed(5) + '\\u00b0'
-                    }})]);
                 }}
             }}
         }} else {{
-            catalog.addSources([A.source(displayRA, displayDec, {{
-                name: label, popupTitle: label,
-                popupDesc: 'RA ' + displayRA.toFixed(5) + '\\u00b0<br>Dec ' + displayDec.toFixed(5) +
-                           '\\u00b0<br>PA ' + displayPA.toFixed(2) + '\\u00b0<br><em>No footprint data</em>'
-            }})]);
+            // No footprint data — just mark the pointing
+            const markerOverlay = labelOverlay || overlay;
+            markerOverlay.add(A.circle(displayRA, displayDec, 0.003, {{
+                color: '#e74c3c', lineWidth: 2
+            }}));
         }}
 
         activeLayers[fpKey] = {{
             overlay: overlay,
-            catalog: catalog,
-            gsCatalog: gsCatalog,
-            _catalogVisible: true,
-            _gsVisible: true,
+            labelOverlay: labelOverlay,
+            gsOverlay: gsOverlay,
             info: {{ label: label, ra: displayRA, dec: displayDec, pa: displayPA }}
         }};
 
-        // Respect current toggle state for newly added footprints
-        if (!showLabels) {{
-            try {{ aladin.removeLayer(catalog); activeLayers[fpKey]._catalogVisible = false; }} catch(e) {{}}
-        }}
-        if (!showGuideStars) {{
-            try {{ aladin.removeLayer(gsCatalog); activeLayers[fpKey]._gsVisible = false; }} catch(e) {{}}
-        }}
-
-        
         const row = document.querySelector('tr[data-fp-key="' + fpKey + '"]');
         if (row) row.classList.add('aladin-active');
     }}
@@ -4288,7 +4378,7 @@ def _parse_obs_time(start_str):
 
     return None
 
-def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
+def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, generate_pngs=False):
     """
     Generate both the detailed OPUP HTML report and the sky plotter visualization.
     
@@ -4296,6 +4386,8 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
         opup_filepath: Path to OPUP .tgz archive
         output_dir: Output directory (defaults to same as OPUP)
         keep_GW: Whether to keep Guide Window columns
+        generate_pngs: Whether to generate sky plot PNGs via roman_visit_viewer
+                       (default: False, uses Aladin Lite embedded viewer instead)
     
     Returns:
         Tuple of (html_report_path, sky_plotter_path, csv_path, archive_path)
@@ -4312,103 +4404,124 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
     output_dir = Path(output_dir)
     opup_stem = Path(opup_filepath).stem.replace('.tgz', '').replace('.tar', '')
     
-    # Track all generated files for archiving
     generated_files = []
+    step = 0
     
     print(f"\n{'='*60}")
     print(f"Generating Integrated OPUP Report")
     print(f"{'='*60}\n")
     
     # ── Step 1: Parse OPUP ──
-    print("Step 1: Parsing OPUP...")
+    step += 1
+    print(f"Step {step}: Parsing OPUP...")
     opup_info = parse_OPUP(opup_filepath)
     
-    # ── Step 1b: Add attitude columns ──     
-    print("\n🧭 Computing spacecraft attitude (pitch & roll)...")
+    # ── Step 2: Add attitude columns ──
+    step += 1
+    print(f"\nStep {step}: Computing spacecraft attitude (pitch & roll)...")
     opup_info = add_attitude_columns(opup_info)
     opup_info = prioritize_columns(opup_info, PRIORITY_COLUMNS)
 
-    # ── Step 1c: Precompute WFI footprints from quaternions ──
-    print("\n🔭 Precomputing WFI footprints from pointing quaternions...")
+    # ── Step 3: Compute V1 and WFI_CEN pointing from quaternion ──
+    step += 1
+    print(f"\nStep {step}: Computing V1 and WFI_CEN pointing from quaternions...")
+    opup_info = add_pointing_columns(opup_info)
+
+    opup_info = prioritize_columns(opup_info, PRIORITY_COLUMNS)
+
+
+    # ── Step 3: Precompute WFI footprints from quaternions ──
+    step += 1
+    print(f"\nStep {step}: Precomputing WFI footprints from pointing quaternions...")
     wfi_footprints = precompute_wfi_footprints(opup_info)
 
-    # ── Step 2: Extract date for Sun position ──
+    # ── Step 4: Extract date for Sun position ──
     sun_date = _parse_sun_date(opup_info)
     
-    # ── Step 3: Sky plotter CSV ──
-    print("\nStep 2: Creating sky plotter CSV...")
+    # ── Step 5: Sky plotter CSV ──
+    step += 1
+    print(f"\nStep {step}: Creating sky plotter CSV...")
     plotter_csv = output_dir / f"{opup_stem}_skymap.csv"
     export_unique_visits_for_plotter(opup_info, plotter_csv)
     generated_files.append(plotter_csv)
     
-    # ── Step 4: Sky plotter HTML (roman_plotter) ──
-    print("\nStep 3: Generating sky plotter...")
+    # ── Step 6: Interactive sky plotter HTML (roman_plotter) ──
+    step += 1
+    print(f"\nStep {step}: Generating interactive sky plotter...")
     sky_plotter_html = _generate_sky_plotter(opup_stem, output_dir, plotter_csv, sun_date)
     if sky_plotter_html:
         generated_files.append(sky_plotter_html)
     
-    # ── Step 5: Sky plot PNGs ──
-    print("\n🔭 Step 4: Generating sky plot previews...")
-    try:
-        visit_png_map = generate_sky_plot_pngs(opup_filepath, output_dir, opup_info)
-        print(f"   Generated {len(visit_png_map)} sky plot PNGs")
-    except Exception as e:
-        print(f"   ⚠️  Sky plot generation failed: {e}")
-        visit_png_map = {}
-
-    # ── Step 6: Sky plot mosaic HTML ──
+    # ── Step 7: Sky plot PNGs (optional, off by default) ──
+    visit_png_map = {}
     skyplot_mosaic_filename = ''
-    if visit_png_map:
-        mosaic_path = output_dir / f"{opup_stem}_skyplots.html"
-        result = generate_skyplot_mosaic_html(
-            visit_png_map, opup_stem, mosaic_path, df=opup_info
-        )
-        if result:
-            skyplot_mosaic_filename = mosaic_path.name
-            generated_files.append(mosaic_path)
+    
+    if generate_pngs:
+        step += 1
+        print(f"\nStep {step}: Generating sky plot PNGs via roman_visit_viewer...")
+        try:
+            visit_png_map = generate_sky_plot_pngs(opup_filepath, output_dir, opup_info)
+            print(f"   Generated {len(visit_png_map)} sky plot PNGs")
+        except Exception as e:
+            print(f"   ⚠️  Sky plot generation failed: {e}")
+            visit_png_map = {}
 
-    # ── Step 7: Main HTML report ──
-    print("\nStep 5: Generating detailed HTML report...")
+        # ── Step 7b: Sky plot mosaic HTML ──
+        if visit_png_map:
+            step += 1
+            print(f"\nStep {step}: Generating sky plot mosaic page...")
+            mosaic_path = output_dir / f"{opup_stem}_skyplots.html"
+            result = generate_skyplot_mosaic_html(
+                visit_png_map, opup_stem, mosaic_path, df=opup_info
+            )
+            if result:
+                skyplot_mosaic_filename = mosaic_path.name
+                generated_files.append(mosaic_path)
+    else:
+        print("\n  ⏭️  Skipping sky plot PNGs (using embedded Aladin Lite viewer)")
+
+    # ── Step 8: Main HTML report ──
+    step += 1
+    print(f"\nStep {step}: Generating detailed HTML report...")
     html_report = output_dir / f"{opup_stem}_report.html"
     html_content = generate_html_report(
         opup_info, opup_filepath, sky_plotter_html,
         visit_png_map=visit_png_map,
         skyplot_mosaic_filename=skyplot_mosaic_filename
     )
-    with open(html_report, 'w', encoding='utf-8') as f:
-        f.write(html_content)
-    generated_files.append(html_report)
 
-    # ── Step 7b: Embed Aladin Lite sky viewer ──
+    # ── Step 8b: Embed Aladin Lite sky viewer ──
     if wfi_footprints:
-        print("  🌐 Embedding Aladin Lite sky viewer...")
+        print(f"  🌐 Embedding Aladin Lite sky viewer...")
         html_content = inject_aladin_into_html(html_content, wfi_footprints, df=opup_info)
         print(f"  ✅ Aladin viewer embedded ({len(wfi_footprints)} footprints)")
 
     with open(html_report, 'w', encoding='utf-8') as f:
         f.write(html_content)
     generated_files.append(html_report)
-
-    # ── Step 8: Full CSV ──
-    print("\nStep 6: Generating full CSV...")
+    
+    # ── Step 9: Full CSV ──
+    step += 1
+    print(f"\nStep {step}: Generating full CSV...")
     full_csv = output_dir / f"{opup_stem}_full.csv"
     write_to_CSV(opup_info, full_csv, keep_GW=keep_GW)
     generated_files.append(full_csv)
 
-    # ── Step 9: Package everything ──
-    print("\nStep 7: Packaging report archive...")
+    # ── Step 10: Package everything ──
+    step += 1
+    print(f"\nStep {step}: Packaging report archive...")
     archive_path = package_report_archive(opup_stem, output_dir, generated_files)
 
     # ── Summary ──
     print(f"\n{'='*60}")
-    print(f"✅ Complete!")
+    print(f"✅ Complete! ({step} steps)")
     print(f"{'='*60}")
     print(f"\n📄 Detailed Report: {html_report}")
     if sky_plotter_html:
-        print(f"🌌 Sky Plot:        {sky_plotter_html}")
+        print(f"🌌 Sky Plotter:     {sky_plotter_html}")
     if skyplot_mosaic_filename:
         print(f"🔭 Sky Plot Mosaic: {output_dir / skyplot_mosaic_filename}")
-    print(f"📊 CSV Data:        {full_csv}")
+    print(f"📊 Full CSV:        {full_csv}")
     print(f"📊 Sky Plot CSV:    {plotter_csv}")
     if archive_path:
         print(f"📦 Report Archive:  {archive_path}")
@@ -4438,6 +4551,8 @@ def setup_parser():
     parser.add_argument('-visit', '--visit_filepath', type=str, nargs='+', help='Path(s) to the visit file(s)', default=[])
     parser.add_argument('-odir', '--output_dir', type=str, help='Output file directory', default=None)
     parser.add_argument('--keep_GW', action='store_true', help='Keep Guide Window information in the output.')
+    parser.add_argument('--pngs', action='store_true', default=False,
+                       help='Generate sky plot PNGs via roman_visit_viewer (slower, off by default)')
     parser.add_argument('--gantt', type=str, help='Generate Gantt chart from aggregated CSV file')
     parser.add_argument('--format', type=str, choices=['csv', 'html', 'both', 'integrated'], default='integrated', 
                        help='Output format: csv, html, both, or integrated (html + sky plot)')
@@ -5253,7 +5368,7 @@ if __name__ == '__main__':
     if output_format == 'integrated':
         # Generate integrated report with sky plotter
         for opup_filepath in opup_filepaths:
-            generate_integrated_report(opup_filepath, output_dir, keep_GW)
+            generate_integrated_report(opup_filepath, output_dir, keep_GW, generate_pngs=args.pngs)
         
         # If in directory mode, also generate aggregated output
         if directory_mode and len(opup_filepaths) > 1:
