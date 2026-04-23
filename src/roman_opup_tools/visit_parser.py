@@ -29,6 +29,199 @@ PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA', 'DEC', 'Posit
                     'WFI_SCI_TABLE', 'READFRAMES', 'WFI_Optical_Element']
 #%%
 
+# ════════════════════════════════════════════════════════════════════════════
+# PART 1: Quaternion-based WFI footprint precomputation
+# Add to visit_parser.py
+# ════════════════════════════════════════════════════════════════════════════
+
+import numpy as np
+import json
+
+# Column names for the ECI→BCS quaternion in the OPUP table
+QUAT_COLS = ['TAR_Q1_ECI2BCS', 'TAR_Q2_ECI2BCS', 'TAR_Q3_ECI2BCS', 'TAR_Q4_ECI2BCS']
+
+def precompute_wfi_footprints(df):
+    """
+    For each unique visit (keyed by Visit_ID + SCI_ID), read the pointing
+    quaternion from the TAR_Q*_ECI2BCS columns, convert to RA/Dec/PA via
+    the same math as roman_visit_viewer.roman_attitude(), build the pysiaf
+    attitude matrix, and extract the sky corners of all 18 WFI SCAs.
+
+    Falls back to RA / DEC / Position_Angle columns when quaternion data
+    is unavailable for a row.
+
+    Returns
+    -------
+    dict
+        JSON-serializable, keyed by a unique row key (Visit_ID or
+        Visit_ID + SCI_ID), each value:
+        {
+            'ra': float,  'dec': float,  'pa': float,   # V1 boresight
+            'ra_cen': float, 'dec_cen': float,           # WFI_CEN on sky
+            'scas': {
+                'WFI01_FULL': [[ra, dec], ...],           # closed polygon
+                ...
+            }
+        }
+    """
+    try:
+        import pysiaf
+        import astropy.units as u
+    except ImportError:
+        print("  ⚠️  pysiaf not installed — skipping WFI footprint precomputation.")
+        return {}
+
+    RSIAF = pysiaf.Siaf('Roman')
+
+    # ── Determine whether quaternion columns are available ──
+    have_quat = all(c in df.columns for c in QUAT_COLS)
+    have_radec = all(c in df.columns for c in ['RA', 'DEC', 'Position_Angle'])
+    if not have_quat and not have_radec:
+        print("  ⚠️  Neither quaternion nor RA/DEC/PA columns found — cannot compute footprints.")
+        return {}
+
+    if have_quat:
+        print("  📐 Using TAR_Q*_ECI2BCS quaternion columns (exact pointing)")
+    else:
+        print("  📐 Quaternion columns not found — falling back to RA/DEC/Position_Angle")
+
+    # ── Build a unique key per exposure row ──
+    # Use Visit_ID + SCI_ID so every dither gets its own footprint
+    key_cols = []
+    if 'Visit_ID' in df.columns:
+        key_cols.append('Visit_ID')
+    if 'SCI_ID' in df.columns:
+        key_cols.append('SCI_ID')
+    if not key_cols:
+        print("  ⚠️  No Visit_ID column — cannot key footprints.")
+        return {}
+
+    # Drop duplicate keys (same pointing doesn't need recomputing)
+    pointing_cols = QUAT_COLS if have_quat else ['RA', 'DEC', 'Position_Angle']
+    # Include all GW columns so guide star positions can be computed
+    gw_cols = [c for c in df.columns if c.startswith('TRK_')]
+    needed_cols = key_cols + pointing_cols + ['RA', 'DEC', 'Position_Angle'] + gw_cols
+    needed_cols = [c for c in needed_cols if c in df.columns]
+    # De-duplicate
+    needed_cols = list(dict.fromkeys(needed_cols))
+    unique_rows = df.drop_duplicates(subset=key_cols)[needed_cols].dropna(subset=pointing_cols)
+
+    print(f"  🔭 Computing WFI footprints for {len(unique_rows)} unique exposures...")
+
+    footprints = {}
+
+    for _, row in unique_rows.iterrows():
+        # Build unique key string
+        row_key = '_'.join(str(row[c]) for c in key_cols)
+
+        try:
+            # ── Derive RA, Dec, V3PA ──
+            if have_quat:
+                q1 = float(row['TAR_Q1_ECI2BCS'])
+                q2 = float(row['TAR_Q2_ECI2BCS'])
+                q3 = float(row['TAR_Q3_ECI2BCS'])
+                q4 = float(row['TAR_Q4_ECI2BCS'])
+                ra_v1, dec_v1, v3pa = roman_attitude.quat_to_radec_pa(q1, q2, q3, q4)
+            else:
+                ra_v1  = float(row['RA'])
+                dec_v1 = float(row['DEC'])
+                v3pa   = float(row['Position_Angle'])
+
+            # ── Build attitude matrix  (same as Exposure.plot()) ──
+            att_mat = pysiaf.rotations.attitude_matrix(0, 0, ra_v1, dec_v1, v3pa)
+
+            # ── WFI_CEN sky position (Aladin centering target) ──
+            wfi_cen = RSIAF['WFI_CEN']
+            wfi_cen.set_attitude_matrix(att_mat)
+            ra_wfi, dec_wfi = pysiaf.rotations.tel_to_sky(
+                att_mat, wfi_cen.V2Ref, wfi_cen.V3Ref
+            )
+            ra_cen  = float(ra_wfi.to(u.deg).value) if hasattr(ra_wfi, 'to') else float(ra_wfi)
+            dec_cen = float(dec_wfi.to(u.deg).value) if hasattr(dec_wfi, 'to') else float(dec_wfi)
+
+            visit_fp = {
+                'ra':      round(ra_v1, 7),
+                'dec':     round(dec_v1, 7),
+                'pa':      round(v3pa, 4),
+                'ra_cen':  round(ra_cen, 7),
+                'dec_cen': round(dec_cen, 7),
+                'scas':    {}
+            }
+
+            # ── Extract corners for each of the 18 SCAs ──
+            for isca in range(1, 19):
+                sca_name = f'WFI{isca:02d}_FULL'
+                aper = RSIAF[sca_name]
+                aper.set_attitude_matrix(att_mat)
+
+                ra_corners = []
+                dec_corners = []
+                for iv in range(1, 5):
+                    x_idl = getattr(aper, f'XIdlVert{iv}')
+                    y_idl = getattr(aper, f'YIdlVert{iv}')
+                    ra_sky, dec_sky = aper.idl_to_sky(x_idl, y_idl)
+                    ra_corners.append(float(ra_sky))
+                    dec_corners.append(float(dec_sky))
+
+                # Close the polygon
+                ra_corners.append(ra_corners[0])
+                dec_corners.append(dec_corners[0])
+
+                visit_fp['scas'][sca_name] = [
+                    [round(r, 7), round(d, 7)]
+                    for r, d in zip(ra_corners, dec_corners)
+                ]
+
+            # ── 6. Extract guide window positions ──
+            # Columns: TRK_USE_GWxx ("GUIDE" or "SKY_FIXED")
+            #          TRK_H_GWxx, TRK_V_GWxx (FGS frame coords)
+            guide_stars = []
+            for isca in range(1, 19):
+                use_col = f'TRK_USE_GW{isca:02d}'
+                h_col   = f'TRK_H_GW{isca:02d}'
+                v_col   = f'TRK_V_GW{isca:02d}'
+
+                if not all(c in row.index for c in [use_col, h_col, v_col]):
+                    continue
+
+                mode_val = str(row.get(use_col, '')).strip().strip('"')
+                if not mode_val or mode_val == 'nan':
+                    continue
+
+                try:
+                    fgs_x = float(row[h_col])
+                    fgs_y = float(row[v_col])
+                except (ValueError, TypeError):
+                    continue
+
+                # Convert FGS frame → science frame → sky
+                # (same as roman_visit_viewer.py Exposure.plot())
+                scix = fgs_x + 2048
+                sciy = 2048 - fgs_y
+
+                sca_name = f'WFI{isca:02d}_FULL'
+                aper = RSIAF[sca_name]
+                aper.set_attitude_matrix(att_mat)
+                gs_ra, gs_dec = aper.sci_to_sky(scix, sciy)
+
+                guide_stars.append({
+                    'sca': isca,
+                    'ra': round(float(gs_ra), 7),
+                    'dec': round(float(gs_dec), 7),
+                    'mode': mode_val   # "GUIDE" or "SKY_FIXED"
+                })
+
+            visit_fp['guide_stars'] = guide_stars
+
+            footprints[row_key] = visit_fp
+
+        except Exception as e:
+            print(f"    ⚠️  Footprint failed for {row_key}: {e}")
+            continue
+
+    print(f"  ✅ Computed footprints for {len(footprints)}/{len(unique_rows)} exposures")
+    return footprints
+
 import matplotlib
 matplotlib.use('Agg')  # non-interactive backend for batch generation
 
@@ -1379,6 +1572,732 @@ def extract_visit_file_contents(opup_filepath, visit_filename):
         traceback.print_exc()
         return None
 
+def get_aladin_css():
+    """Returns CSS for the Aladin Lite panel. Plain string, not f-string."""
+    return """
+        /* ── Aladin Lite Panel ── */
+        #aladin-panel {
+            position: fixed;
+            bottom: 0;
+            right: 0;
+            width: 560px;
+            height: 520px;
+            background: #1a1a2e;
+            border: 2px solid #3498db;
+            border-radius: 12px 0 0 0;
+            z-index: 2000;
+            display: none;
+            flex-direction: column;
+            box-shadow: 0 -4px 30px rgba(0, 0, 0, 0.6);
+            transition: width 0.3s ease, height 0.3s ease;
+            resize: both;
+            overflow: hidden;
+        }
+        #aladin-panel.expanded {
+            width: 800px;
+            height: 700px;
+        }
+        #aladin-panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 14px;
+            background: #0f3460;
+            border-radius: 12px 0 0 0;
+            cursor: grab;
+            flex-shrink: 0;
+            user-select: none;
+        }
+        #aladin-panel-header:active {
+            cursor: grabbing;
+        }
+        #aladin-panel-header h3 {
+            margin: 0;
+            font-size: 13px;
+            color: #e0e0e0;
+            font-family: 'Consolas', 'Courier New', monospace;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .aladin-panel-controls {
+            display: flex;
+            gap: 4px;
+            flex-shrink: 0;
+        }
+        .aladin-panel-controls button {
+            background: none;
+            border: 1px solid #3498db;
+            color: #3498db;
+            border-radius: 4px;
+            padding: 2px 8px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+            line-height: 1.4;
+        }
+        .aladin-panel-controls button:hover {
+            background: #3498db;
+            color: white;
+        }
+        #aladin-container {
+            flex: 1;
+            min-height: 0;
+            position: relative;
+        }
+        #aladin-info-bar {
+            padding: 5px 14px;
+            background: #0d1b36;
+            color: #95a5a6;
+            font-size: 11px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            display: flex;
+            justify-content: space-between;
+            flex-shrink: 0;
+            flex-wrap: wrap;
+            gap: 4px;
+            border-top: 1px solid #2c3e6e;
+        }
+        #aladin-info-bar .coord-val {
+            color: #3498db;
+            font-weight: bold;
+        }
+        #aladin-survey-label {
+            color: #f1c40f;
+            font-weight: bold;
+        }
+        tr[data-fp-key] {
+            cursor: pointer;
+        }
+        tr[data-fp-key]:hover td {
+            background-color: rgba(52, 152, 219, 0.08) !important;
+        }
+        tr.aladin-active {
+            outline: 2px solid #f1c40f;
+            outline-offset: -2px;
+        }
+        tr.aladin-active td {
+            background-color: rgba(241, 196, 15, 0.06) !important;
+        }
+        #aladin-open-btn {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #0f3460;
+            color: #3498db;
+            border: 2px solid #3498db;
+            border-radius: 50%;
+            width: 48px;
+            height: 48px;
+            font-size: 22px;
+            cursor: pointer;
+            z-index: 1999;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.4);
+            transition: all 0.2s;
+        }
+        #aladin-open-btn:hover {
+            background: #3498db;
+            color: white;
+            transform: scale(1.1);
+        }
+"""
+
+def get_aladin_html():
+    """Returns the HTML for the Aladin panel. Plain string."""
+    return """
+    <button id="aladin-open-btn" onclick="openAladinPanel()" title="Open WFI Sky Viewer">&#x1F52D;</button>
+    <div id="aladin-panel">
+        <div id="aladin-panel-header">
+            <h3>&#x1F52D; <span id="aladin-title">WFI Sky Viewer</span></h3>
+            <div class="aladin-panel-controls">
+                <button onclick="selectAllFootprints()" title="Select all visits">All</button>
+                <button onclick="clearAllFootprints()" title="Clear all footprints">&#x1F5D1;</button>
+                <button onclick="toggleAladinSurvey()" title="Cycle survey background">&#x1F5FA;</button>
+                <button onclick="toggleSCALabels()" title="Toggle SCA labels" id="label-toggle-btn">&#x1F3F7;</button>
+                <button onclick="toggleGuideStars()" title="Toggle guide stars" id="gs-toggle-btn">&#x2B50;</button>
+                <button onclick="toggleAladinExpand()" title="Expand / Shrink" id="expand-btn">&#x29e2;</button>
+                <button onclick="closeAladinPanel()" title="Close panel">&#x2715;</button>
+            </div>
+        </div>
+        <div id="aladin-container"></div>
+        <div id="aladin-info-bar">
+            <span>Visit <span id="aladin-visit-id" class="coord-val">&mdash;</span></span>
+            <span>RA <span id="aladin-ra" class="coord-val">&mdash;</span>&deg;</span>
+            <span>Dec <span id="aladin-dec" class="coord-val">&mdash;</span>&deg;</span>
+            <span>PA <span id="aladin-pa" class="coord-val">&mdash;</span>&deg;</span>
+            <span id="aladin-survey-label">DSS2</span>
+        </div>
+    </div>
+"""
+
+def add_aladin_data_attributes_to_row(tr_tag, row):
+    """
+    Splice data-q1..q4, data-ra, data-dec, data-pa, data-visit-id,
+    and data-sci-id into an opening <tr ...> tag.
+
+    The JavaScript will use the quaternion to look up precomputed
+    footprints keyed by 'VisitID_SciID'.
+
+    Args:
+        tr_tag: str  — e.g. '<tr class="group-parent-row">'
+        row:    pandas Series with QUAT_COLS and/or RA, DEC, Position_Angle
+    Returns:
+        str  — modified <tr> tag
+    """
+    try:
+        vid = str(row.get('Visit_ID', '')).strip()
+        sid = str(row.get('SCI_ID', '')).strip()
+        if not vid:
+            return tr_tag
+
+        # Build the same key used in precompute_wfi_footprints()
+        row_key = f"{vid}_{sid}" if sid else vid
+
+        parts = [f'data-fp-key="{row_key}"']
+        parts.append(f'data-visit-id="{vid}"')
+        if sid:
+            parts.append(f'data-sci-id="{sid}"')
+
+        # Quaternion (preferred)
+        have_q = True
+        for qc in QUAT_COLS:
+            val = row.get(qc, None)
+            try:
+                fval = float(val)
+                if np.isnan(fval):
+                    have_q = False
+                    break
+                short = qc.replace('TAR_', '').replace('_ECI2BCS', '').lower()
+                parts.append(f'data-{short}="{fval}"')
+            except (ValueError, TypeError):
+                have_q = False
+                break
+
+        # Always include RA/Dec/PA for info-bar display (even if derived)
+        for col, attr in [('RA', 'ra'), ('DEC', 'dec'), ('Position_Angle', 'pa')]:
+            val = row.get(col, None)
+            try:
+                parts.append(f'data-{attr}="{float(val)}"')
+            except (ValueError, TypeError):
+                pass
+
+        attrs = ' '.join(parts)
+        return tr_tag.replace('>', ' ' + attrs + '>', 1)
+
+    except Exception:
+        return tr_tag
+    
+
+def get_aladin_javascript(wfi_footprints_json):
+    return f"""
+    <link rel="stylesheet"
+          href="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.min.css" />
+    <script src="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js"
+            charset="utf-8"></script>
+    <script>
+    const wfiFootprints = {wfi_footprints_json};
+
+    let aladin = null, aladinReady = false;
+    let showLabels = true, showGuideStars = true, surveyIdx = 0;
+    let activeLayers = {{}};
+    let visitColorIdx = 0;
+
+    const VISIT_COLORS = [
+        '#ffffff','#3498db','#e74c3c','#2ecc71','#f1c40f','#e67e22',
+        '#9b59b6','#1abc9c','#fd79a8','#00cec9','#6c5ce7','#ff7675'
+    ];
+    const SURVEYS      = ['P/DSS2/color','P/2MASS/color','P/allWISE/color',
+                          'P/PanSTARRS/DR1/color-z-zg-g','CDS/P/unWISE/color-W2-W1W2-W1'];
+    const SURVEY_NAMES = ['DSS2','2MASS','WISE','PanSTARRS','unWISE'];
+
+    function initAladin() {{
+        if (aladinReady) return;
+        A.init.then(() => {{
+            aladin = A.aladin('#aladin-container', {{
+                survey: SURVEYS[0], fov: 0.85, showReticle: true,
+                showZoomControl: true, showLayersControl: false,
+                showGotoControl: false, showFrame: true,
+                cooFrame: 'J2000', projection: 'TAN'
+            }});
+            aladinReady = true;
+        }});
+    }}
+
+    function openAladinPanel() {{
+        document.getElementById('aladin-panel').style.display = 'flex';
+        document.getElementById('aladin-open-btn').style.display = 'none';
+        if (!aladinReady) initAladin();
+        setTimeout(() => {{ if (aladin && aladin.setSize) aladin.setSize(); }}, 120);        
+    }}
+    function closeAladinPanel() {{
+        document.getElementById('aladin-panel').style.display = 'none';
+        document.getElementById('aladin-open-btn').style.display = 'flex';
+    }}
+    function toggleAladinExpand() {{
+        const p = document.getElementById('aladin-panel');
+        p.classList.toggle('expanded');
+        document.getElementById('expand-btn').innerHTML =
+            p.classList.contains('expanded') ? '&#x29e1;' : '&#x29e2;';
+        setTimeout(() => {{ if (aladin && aladin.setSize) aladin.setSize(); }}, 120);        
+    }}
+    function toggleAladinSurvey() {{
+        if (!aladin) return;
+        surveyIdx = (surveyIdx + 1) % SURVEYS.length;
+        aladin.setImageSurvey(SURVEYS[surveyIdx]);
+        document.getElementById('aladin-survey-label').textContent = SURVEY_NAMES[surveyIdx];
+    }}
+function toggleSCALabels() {{
+        showLabels = !showLabels;
+        for (const layers of Object.values(activeLayers)) {{
+            try {{
+                if (showLabels) {{
+                    if (!layers._catalogVisible) {{
+                        aladin.addCatalog(layers.catalog);
+                        layers._catalogVisible = true;
+                    }}
+                }} else {{
+                    aladin.removeLayer(layers.catalog);
+                    layers._catalogVisible = false;
+                }}
+            }} catch(e) {{}}
+        }}
+        document.getElementById('label-toggle-btn').style.opacity = showLabels ? 1 : 0.4;
+    }}
+
+    function toggleGuideStars() {{
+        showGuideStars = !showGuideStars;
+        for (const layers of Object.values(activeLayers)) {{
+            if (!layers.gsCatalog) continue;
+            try {{
+                if (showGuideStars) {{
+                    if (!layers._gsVisible) {{
+                        aladin.addCatalog(layers.gsCatalog);
+                        layers._gsVisible = true;
+                    }}
+                }} else {{
+                    aladin.removeLayer(layers.gsCatalog);
+                    layers._gsVisible = false;
+                }}
+            }} catch(e) {{}}
+        }}
+        document.getElementById('gs-toggle-btn').style.opacity = showGuideStars ? 1 : 0.4;
+    }}
+    
+    function removeFootprint(fpKey) {{
+        if (!activeLayers[fpKey]) return;
+        try {{ aladin.removeLayer(activeLayers[fpKey].overlay); }} catch(e) {{}}
+        try {{ aladin.removeLayer(activeLayers[fpKey].catalog); }} catch(e) {{}}
+        try {{ if (activeLayers[fpKey].gsCatalog) aladin.removeLayer(activeLayers[fpKey].gsCatalog); }} catch(e) {{}}
+        delete activeLayers[fpKey];
+        const row = document.querySelector('tr[data-fp-key="' + fpKey + '"]');
+        if (row) row.classList.remove('aladin-active');
+        updateInfoBar();
+    }}
+
+    function clearAllFootprints() {{
+        for (const fpKey of Object.keys(activeLayers)) {{
+            try {{ aladin.removeLayer(activeLayers[fpKey].overlay); }} catch(e) {{}}
+            try {{ aladin.removeLayer(activeLayers[fpKey].catalog); }} catch(e) {{}}
+            try {{ if (activeLayers[fpKey].gsCatalog) aladin.removeLayer(activeLayers[fpKey].gsCatalog); }} catch(e) {{}}
+        }}
+        activeLayers = {{}};
+        visitColorIdx = 0;
+        document.querySelectorAll('tr.aladin-active').forEach(el => el.classList.remove('aladin-active'));
+        updateInfoBar();
+    }}
+
+    function selectAllFootprints() {{
+        openAladinPanel();
+        const go = () => {{
+            if (!aladinReady) {{ setTimeout(go, 200); return; }}
+            clearAllFootprints();
+            document.querySelectorAll('tr[data-fp-key]').forEach(function(row) {{
+                const fpKey   = row.dataset.fpKey;
+                const ra      = parseFloat(row.dataset.ra);
+                const dec     = parseFloat(row.dataset.dec);
+                const pa      = parseFloat(row.dataset.pa);
+                const visitId = row.dataset.visitId || '';
+                const sciId   = row.dataset.sciId   || '';
+                if (fpKey && !activeLayers[fpKey] && !isNaN(ra) && !isNaN(dec)) {{
+                    addFootprint(fpKey, ra, dec, isNaN(pa) ? 0 : pa, visitId, sciId);
+                }}
+            }});
+            let raMin = 999, raMax = -999, decMin = 999, decMax = -999;
+            for (const fpKey of Object.keys(activeLayers)) {{
+                const fp = wfiFootprints[fpKey];
+                if (fp && fp.scas) {{
+                    for (const corners of Object.values(fp.scas)) {{
+                        for (const [r, d] of corners) {{
+                            if (r < raMin)  raMin  = r;
+                            if (r > raMax)  raMax  = r;
+                            if (d < decMin) decMin = d;
+                            if (d > decMax) decMax = d;
+                        }}
+                    }}
+                }}
+            }}
+            if (raMin < 999) {{
+                const cra  = (raMin + raMax) / 2;
+                const cdec = (decMin + decMax) / 2;
+                const span = Math.max(raMax - raMin, decMax - decMin);
+                aladin.gotoRaDec(cra, cdec);
+                aladin.setFoV(Math.max(span * 1.3, 0.85));
+            }}
+            updateInfoBar();
+        }};
+        go();
+    }}
+
+    function updateInfoBar() {{
+        const keys = Object.keys(activeLayers);
+        const n = keys.length;
+        if (n === 0) {{
+            document.getElementById('aladin-visit-id').textContent = '\\u2014';
+            document.getElementById('aladin-ra').textContent  = '\\u2014';
+            document.getElementById('aladin-dec').textContent = '\\u2014';
+            document.getElementById('aladin-pa').textContent  = '\\u2014';
+            document.getElementById('aladin-title').textContent = 'WFI Sky Viewer';
+        }} else if (n === 1) {{
+            const info = activeLayers[keys[0]].info;
+            document.getElementById('aladin-visit-id').textContent = info.label;
+            document.getElementById('aladin-ra').textContent  = info.ra.toFixed(5);
+            document.getElementById('aladin-dec').textContent = info.dec.toFixed(5);
+            document.getElementById('aladin-pa').textContent  = info.pa.toFixed(2);
+            document.getElementById('aladin-title').textContent = info.label + ' \\u2014 PA ' + info.pa.toFixed(1) + '\\u00b0';
+        }} else {{
+            document.getElementById('aladin-visit-id').textContent = n + ' selected';
+            document.getElementById('aladin-ra').textContent  = '\\u2014';
+            document.getElementById('aladin-dec').textContent = '\\u2014';
+            document.getElementById('aladin-pa').textContent  = '\\u2014';
+            document.getElementById('aladin-title').textContent = n + ' footprints selected';
+        }}
+    }}
+
+    function addFootprint(fpKey, displayRA, displayDec, displayPA, visitId, sciId) {{
+        const fp = wfiFootprints[fpKey];
+        const label = sciId ? ('Visit ' + visitId + ' / Exp ' + sciId) : ('Visit ' + visitId);
+        const visitColor = VISIT_COLORS[visitColorIdx % VISIT_COLORS.length];
+        visitColorIdx++;
+
+        // SCA overlay
+        const overlay = A.graphicOverlay({{ color: visitColor, lineWidth: 2 }});
+        aladin.addOverlay(overlay);
+
+        // SCA labels + boresight markers
+        const catalog = A.catalog({{ shape: 'circle', sourceSize: 8, color: '#f1c40f' }});
+        aladin.addCatalog(catalog);
+        if (!showLabels) catalog.hide();
+
+        // Guide star catalog (separate for independent toggling)
+        const gsCatalog = A.catalog({{ shape: 'circle', sourceSize: 14, color: '#f1c40f' }});
+        aladin.addCatalog(gsCatalog);
+        if (!showGuideStars) gsCatalog.hide();
+
+        if (fp && fp.scas) {{
+            // Draw SCA polygons
+            for (const [scaName, corners] of Object.entries(fp.scas)) {{
+                overlay.add(A.polygon(corners, {{
+                    color: visitColor, lineWidth: 1.5,
+                    fill: true, fillColor: visitColor, opacity: 0.08
+                }}));
+                overlay.add(A.polygon(corners, {{
+                    color: visitColor, lineWidth: 2, fill: false
+                }}));
+                const cRa  = corners.reduce((s,c) => s + c[0], 0) / corners.length;
+                const cDec = corners.reduce((s,c) => s + c[1], 0) / corners.length;
+                const shortName = scaName.replace('_FULL','').replace('WFI','SCA');
+                catalog.addSources([A.source(cRa, cDec, {{
+                    name: shortName, popupTitle: scaName,
+                    popupDesc: label + '<br>RA ' + cRa.toFixed(5) + '\\u00b0  Dec ' + cDec.toFixed(5) + '\\u00b0'
+                }})]);
+            }}
+            // V1 boresight
+            if (fp.ra && fp.dec) {{
+                catalog.addSources([A.source(fp.ra, fp.dec, {{
+                    name: '\\u271b V1', popupTitle: 'V1 Boresight (' + label + ')',
+                    popupDesc: 'RA ' + fp.ra.toFixed(5) + '\\u00b0<br>Dec ' + fp.dec.toFixed(5) +
+                               '\\u00b0<br>PA(V3) ' + fp.pa.toFixed(2) + '\\u00b0'
+                }})]);
+            }}
+            // WFI_CEN
+            if (fp.ra_cen && fp.dec_cen) {{
+                catalog.addSources([A.source(fp.ra_cen, fp.dec_cen, {{
+                    name: '\\u271b WFI', popupTitle: 'WFI Center (' + label + ')',
+                    popupDesc: 'RA ' + fp.ra_cen.toFixed(5) + '\\u00b0<br>Dec ' + fp.dec_cen.toFixed(5) + '\\u00b0'
+                }})]);
+            }}
+
+            // ── Guide stars ──
+            // GUIDE = yellow filled circle, SKY_FIXED = grey open circle
+            if (fp.guide_stars && fp.guide_stars.length > 0) {{
+                for (const gs of fp.guide_stars) {{
+                    const isGuide = (gs.mode === 'GUIDE');
+                    const gsColor = isGuide ? '#f1c40f' : '#7f8c8d';
+                    const gsSymbol = isGuide ? '\\u2605' : '\\u25cb';
+                    const gsLabel = gsSymbol + ' GW' + String(gs.sca).padStart(2,'0');
+
+                    // Draw a circle on the overlay for visibility
+                    overlay.add(A.circle(gs.ra, gs.dec, 0.003, {{
+                        color: gsColor, lineWidth: isGuide ? 2.5 : 1.5
+                    }}));
+
+                    gsCatalog.addSources([A.source(gs.ra, gs.dec, {{
+                        name: gsLabel,
+                        popupTitle: (isGuide ? 'Guide Star' : 'Sky Fixed') + ' \\u2014 SCA ' + gs.sca,
+                        popupDesc: label +
+                                   '<br>Mode: <b>' + gs.mode + '</b>' +
+                                   '<br>SCA: WFI' + String(gs.sca).padStart(2,'0') +
+                                   '<br>RA ' + gs.ra.toFixed(5) + '\\u00b0' +
+                                   '<br>Dec ' + gs.dec.toFixed(5) + '\\u00b0'
+                    }})]);
+                }}
+            }}
+        }} else {{
+            catalog.addSources([A.source(displayRA, displayDec, {{
+                name: label, popupTitle: label,
+                popupDesc: 'RA ' + displayRA.toFixed(5) + '\\u00b0<br>Dec ' + displayDec.toFixed(5) +
+                           '\\u00b0<br>PA ' + displayPA.toFixed(2) + '\\u00b0<br><em>No footprint data</em>'
+            }})]);
+        }}
+
+        activeLayers[fpKey] = {{
+            overlay: overlay,
+            catalog: catalog,
+            gsCatalog: gsCatalog,
+            _catalogVisible: true,
+            _gsVisible: true,
+            info: {{ label: label, ra: displayRA, dec: displayDec, pa: displayPA }}
+        }};
+
+        // Respect current toggle state for newly added footprints
+        if (!showLabels) {{
+            try {{ aladin.removeLayer(catalog); activeLayers[fpKey]._catalogVisible = false; }} catch(e) {{}}
+        }}
+        if (!showGuideStars) {{
+            try {{ aladin.removeLayer(gsCatalog); activeLayers[fpKey]._gsVisible = false; }} catch(e) {{}}
+        }}
+
+        
+        const row = document.querySelector('tr[data-fp-key="' + fpKey + '"]');
+        if (row) row.classList.add('aladin-active');
+    }}
+
+    function showFootprint(fpKey, displayRA, displayDec, displayPA, visitId, sciId, multiSelect) {{
+        openAladinPanel();
+        const go = () => {{
+            if (!aladinReady) {{ setTimeout(go, 200); return; }}
+            if (multiSelect) {{
+                if (activeLayers[fpKey]) {{
+                    removeFootprint(fpKey);
+                }} else {{
+                    addFootprint(fpKey, displayRA, displayDec, displayPA, visitId, sciId);
+                }}
+            }} else {{
+                clearAllFootprints();
+                addFootprint(fpKey, displayRA, displayDec, displayPA, visitId, sciId);
+            }}
+            const fp = wfiFootprints[fpKey];
+            const cra  = (fp && fp.ra_cen) ? fp.ra_cen : displayRA;
+            const cdec = (fp && fp.dec_cen) ? fp.dec_cen : displayDec;
+            if (!multiSelect || Object.keys(activeLayers).length <= 1) {{
+                aladin.gotoRaDec(cra, cdec);
+                aladin.setFoV(0.85);
+            }}
+            updateInfoBar();
+        }};
+        go();
+    }}
+
+    document.addEventListener('DOMContentLoaded', function() {{
+        document.getElementById('aladin-open-btn').style.display = 'flex';
+        document.querySelectorAll('tr[data-fp-key]').forEach(function(row) {{
+            row.addEventListener('click', function(e) {{
+                if (e.target.tagName === 'A' || e.target.tagName === 'BUTTON' ||
+                    e.target.closest('.expand-btn') ||
+                    e.target.closest('.sky-preview-wrapper')) return;
+                const fpKey   = this.dataset.fpKey;
+                const ra      = parseFloat(this.dataset.ra);
+                const dec     = parseFloat(this.dataset.dec);
+                const pa      = parseFloat(this.dataset.pa);
+                const visitId = this.dataset.visitId  || '';
+                const sciId   = this.dataset.sciId    || '';
+                const multi   = e.ctrlKey || e.metaKey;
+                if (fpKey && !isNaN(ra) && !isNaN(dec)) {{
+                    showFootprint(fpKey, ra, dec, isNaN(pa) ? 0 : pa, visitId, sciId, multi);
+                }}
+            }});
+        }});
+        (function() {{
+            const panel  = document.getElementById('aladin-panel');
+            const header = document.getElementById('aladin-panel-header');
+            let drag = false, sx, sy, ox, oy;
+            header.addEventListener('mousedown', function(e) {{
+                if (e.target.tagName === 'BUTTON') return;
+                drag = true; sx = e.clientX; sy = e.clientY;
+                const r = panel.getBoundingClientRect();
+                ox = r.left; oy = r.top;
+                panel.style.left = ox+'px'; panel.style.top = oy+'px';
+                panel.style.right = 'auto'; panel.style.bottom = 'auto';
+            }});
+            document.addEventListener('mousemove', function(e) {{
+                if (!drag) return;
+                panel.style.left = (ox + e.clientX - sx) + 'px';
+                panel.style.top  = (oy + e.clientY - sy) + 'px';
+            }});
+            document.addEventListener('mouseup', function() {{ drag = false; }});
+        }})();
+        if (window.ResizeObserver) {{
+            new ResizeObserver(() => {{
+                if (aladin) {{
+                    if (aladin.setSize) {{ aladin.setSize(); }}
+                    else if (aladin.view && aladin.view.requestRedraw) {{ aladin.view.requestRedraw(); }}
+                }}
+            }}).observe(document.getElementById('aladin-panel'));
+        }}        
+    }});
+    </script>
+"""
+
+def _add_data_attrs_to_table_rows(html_content, df):
+    """
+    Post-process rendered HTML to add data-fp-key, data-ra, data-dec,
+    data-pa, data-visit-id, data-sci-id attributes to <tr> elements.
+    
+    Strategy: Build a lookup from SCI_ID → attributes, then scan every
+    <tr in the HTML. For each <tr>, look ahead in that row's content for 
+    a known SCI_ID and inject the attrs.
+    """
+    have_radec = all(c in df.columns for c in ['RA', 'DEC', 'Position_Angle'])
+    if 'Visit_ID' not in df.columns:
+        return html_content
+
+    # Build lookup: SCI_ID string → attr dict
+    # SCI_ID is unique per row, so it's the best token to search for
+    use_sci_id = 'SCI_ID' in df.columns
+    
+    token_to_attrs = {}   # search_token → HTML attr string
+
+    for _, row in df.iterrows():
+        vid = str(row.get('Visit_ID', '')).strip()
+        if not vid:
+            continue
+        sid = str(row.get('SCI_ID', '')).strip() if use_sci_id else ''
+        fp_key = f"{vid}_{sid}" if sid else vid
+
+        # The token we'll search for in the HTML to identify this row
+        search_token = sid if sid else vid
+        if not search_token or search_token in token_to_attrs:
+            continue
+
+        parts = [f'data-fp-key="{fp_key}"', f'data-visit-id="{vid}"']
+        if sid:
+            parts.append(f'data-sci-id="{sid}"')
+
+        try:
+            ra = float(row.get('RA', float('nan')))
+            if not np.isnan(ra):
+                parts.append(f'data-ra="{ra}"')
+        except (ValueError, TypeError):
+            pass
+        try:
+            dec = float(row.get('DEC', float('nan')))
+            if not np.isnan(dec):
+                parts.append(f'data-dec="{dec}"')
+        except (ValueError, TypeError):
+            pass
+        try:
+            pa = float(row.get('Position_Angle', float('nan')))
+            if not np.isnan(pa):
+                parts.append(f'data-pa="{pa}"')
+        except (ValueError, TypeError):
+            pass
+
+        token_to_attrs[search_token] = ' '.join(parts)
+
+    if not token_to_attrs:
+        return html_content
+
+    # Split HTML into chunks between <tr and the next <tr (or end)
+    # This avoids cross-row regex matching entirely.
+    #
+    # We split on every occurrence of '<tr' and process each chunk.
+    
+    pieces = re.split(r'(<tr\b)', html_content)
+    # pieces = ['stuff before first <tr', '<tr', ' rest of row 1...', '<tr', ' rest of row 2...', ...]
+    # Even indices are content between/before <tr tags
+    # Odd indices are the literal '<tr' strings
+
+    modified_count = 0
+    used_tokens = set()
+
+    for i in range(1, len(pieces), 2):
+        # pieces[i] = '<tr'
+        # pieces[i+1] = ' class="...">\n  <td>...</td>\n  ...\n</tr>\n...'
+        if i + 1 >= len(pieces):
+            break
+
+        chunk = pieces[i + 1]
+
+        # Skip if this <tr> already has data-fp-key
+        # (check just the opening tag portion, up to first >)
+        tag_end = chunk.find('>')
+        if tag_end == -1:
+            continue
+        opening_attrs = chunk[:tag_end]
+        if 'data-fp-key' in opening_attrs:
+            continue
+
+        # Search this chunk for any of our tokens
+        for token, attr_str in token_to_attrs.items():
+            if token in used_tokens:
+                continue
+            if token in chunk:
+                # Inject attrs into the opening <tr tag
+                pieces[i + 1] = ' ' + attr_str + chunk
+                modified_count += 1
+                used_tokens.add(token)
+                break  # one token per row
+
+    html_content = ''.join(pieces)
+    print(f"  🏷️  Added Aladin data attributes to {modified_count} table rows")
+    return html_content
+
+
+def inject_aladin_into_html(html_content, wfi_footprints, df=None):
+    """
+    Inject Aladin Lite CSS, HTML panel, JS, AND data attributes into
+    a rendered HTML string.
+    
+    Args:
+        html_content:   str — the complete HTML report string
+        wfi_footprints: dict from precompute_wfi_footprints()
+        df:             pandas DataFrame (opup_info) — needed to add 
+                        data-fp-key attrs to table rows
+    """
+    fp_json = json.dumps(wfi_footprints if wfi_footprints else {})
+
+    # 1. Add data-fp-key attributes to <tr> elements 
+    if df is not None:
+        html_content = _add_data_attrs_to_table_rows(html_content, df)
+
+    # 2. CSS → insert before the FIRST </style>
+    css = get_aladin_css()
+    html_content = html_content.replace('</style>', css + '\n    </style>', 1)
+
+    # 3. HTML panel + JS → insert before </body>
+    panel_html = get_aladin_html()
+    panel_js   = get_aladin_javascript(fp_json)
+    html_content = html_content.replace(
+        '</body>',
+        panel_html + '\n' + panel_js + '\n</body>',
+        1
+    )
+
+    return html_content
+
 def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map=None, skyplot_mosaic_filename=None):
     """
     Generate HTML content with hyperlinks to visit files and horizontal scrolling.
@@ -1481,6 +2400,8 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
             total_duration_seconds = 0
             total_duration_display = "N/A"
     
+
+
     # Start HTML document
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -3012,6 +3933,7 @@ def syntax_highlight_visit_content(content):
         highlighted_lines.append(highlighted_line)
     
     return '\n'.join(highlighted_lines)
+
 def write_to_HTML(df, output_html, opup_filepath, keep_GW=True, 
                   sky_plotter_html=None, visit_png_map=None):
     """
@@ -3061,7 +3983,6 @@ def process_OPUPs_html(opup_filepaths, output_dir=None, keep_GW=True):
             write_to_HTML(opup_info, output_html, opup_filepath, keep_GW=keep_GW)
         else:
             print(f'No columns were returned for {opup_filepath}')
-
 
 def export_unique_visits_for_plotter(df, output_csv):
     """
@@ -3144,7 +4065,6 @@ def _parse_sun_date(opup_info):
     
     print(f"  ⚠️  Could not parse visit date, using today: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
     return datetime.now(timezone.utc)
-
 
 def _generate_sky_plotter(opup_stem, output_dir, plotter_csv, sun_date):
     """Generate the interactive sky plotter HTML via roman_plotter."""
@@ -3408,6 +4328,10 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
     opup_info = add_attitude_columns(opup_info)
     opup_info = prioritize_columns(opup_info, PRIORITY_COLUMNS)
 
+    # ── Step 1c: Precompute WFI footprints from quaternions ──
+    print("\n🔭 Precomputing WFI footprints from pointing quaternions...")
+    wfi_footprints = precompute_wfi_footprints(opup_info)
+
     # ── Step 2: Extract date for Sun position ──
     sun_date = _parse_sun_date(opup_info)
     
@@ -3454,7 +4378,17 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True):
     with open(html_report, 'w', encoding='utf-8') as f:
         f.write(html_content)
     generated_files.append(html_report)
-    
+
+    # ── Step 7b: Embed Aladin Lite sky viewer ──
+    if wfi_footprints:
+        print("  🌐 Embedding Aladin Lite sky viewer...")
+        html_content = inject_aladin_into_html(html_content, wfi_footprints, df=opup_info)
+        print(f"  ✅ Aladin viewer embedded ({len(wfi_footprints)} footprints)")
+
+    with open(html_report, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    generated_files.append(html_report)
+
     # ── Step 8: Full CSV ──
     print("\nStep 6: Generating full CSV...")
     full_csv = output_dir / f"{opup_stem}_full.csv"

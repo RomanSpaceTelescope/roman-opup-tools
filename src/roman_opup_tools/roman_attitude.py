@@ -65,6 +65,54 @@ def ecliptic_to_equatorial(ecliptic_coords):
     
     return np.array([x_eq, y_eq, z_eq])
 
+def quat_to_radec_pa(q1, q2, q3, q4):
+    """
+    Convert ECI→BCS quaternion (scalar-last: x, y, z, w) to (RA, Dec, V3PA)
+    in degrees.  Identical to roman_visit_viewer.roman_attitude().
+
+    Parameters
+    ----------
+    q1, q2, q3, q4 : float
+        Quaternion components  (x, y, z, w  — scalar-last).
+
+    Returns
+    -------
+    ra_deg, dec_deg, pa_v3_deg : float
+        V1 boresight RA/Dec and V3 position angle, all in degrees.
+    """
+    x, y, z, w = q1, q2, q3, q4
+
+    # Rotation matrix  ECI → BCS
+    R = np.array([
+        [1 - 2*(y*y + z*z),  2*(x*y - z*w),  2*(x*z + y*w)],
+        [2*(x*y + z*w),  1 - 2*(x*x + z*z),  2*(y*z - x*w)],
+        [2*(x*z - y*w),  2*(y*z + x*w),  1 - 2*(x*x + y*y)]
+    ])
+
+    V1 = R[:, 0]   # pointing axis
+    V3 = R[:, 2]   # +V3 axis
+
+    V1 /= np.linalg.norm(V1)
+    dec = np.arcsin(V1[2])
+    ra  = np.arctan2(V1[1], V1[0])
+    if ra < 0:
+        ra += 2 * np.pi
+
+    # PA(+V3):  angle of V3 projected onto the sky, measured N→E
+    Z = np.array([0.0, 0.0, 1.0])
+    N = Z - V1[2] * V1          # celestial-north projected onto tangent plane
+    N /= np.linalg.norm(N)
+    E = np.cross(N, V1)         # east direction
+
+    V3p = V3 - np.dot(V3, V1) * V1   # V3 projected onto tangent plane
+    V3p /= np.linalg.norm(V3p)
+
+    pa_v3 = np.arctan2(np.dot(V3p, E), np.dot(V3p, N))
+    if pa_v3 < 0:
+        pa_v3 += 2 * np.pi
+
+    return np.degrees(ra), np.degrees(dec), np.degrees(pa_v3)
+
 def query_jpl_horizons(target, observer, start_time, stop_time, step_size='1h'):
     epochs_time = {'start': start_time.iso, 'stop': stop_time.iso, 'step': step_size}
     return Horizons(id=target, location=observer, epochs=epochs_time)
