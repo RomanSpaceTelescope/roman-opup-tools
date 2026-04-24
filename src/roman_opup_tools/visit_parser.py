@@ -4263,7 +4263,7 @@ def add_attitude_columns(df):
         return df
     
     try:
-        from roman_opup_tools.roman_attitude import RomanPointing, get_sun_from_l2_jpl
+        from roman_opup_tools.roman_attitude import RomanPointing, OEMEphemeris, get_sun_from_l2_jpl, get_sun_from_rst
         from astropy.time import Time
         from astropy.coordinates import SkyCoord
         from astropy import units as u
@@ -4274,6 +4274,8 @@ def add_attitude_columns(df):
     sun_angles = []
     pitches = []
     rolls = []
+    oem = OEMEphemeris("RST_EPH_PRED_LONG_2026250_2027065_01.oem")
+
 
     for idx, row in df.iterrows():
         if any(pd.isna(row.get(c)) for c in required):
@@ -4297,6 +4299,7 @@ def add_attitude_columns(df):
 
             # ── Sun position from JPL for this exact time ──
             sun_ra, sun_dec = get_sun_from_l2_jpl(obs_time)
+            # sun_ra, sun_dec = get_sun_from_rst(obs_time, oem)
             sun_coord = SkyCoord(ra=sun_ra*u.deg, dec=sun_dec*u.deg, frame='icrs')
 
             # ── Sun angle: pure geometry ──

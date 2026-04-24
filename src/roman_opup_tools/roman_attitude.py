@@ -9,14 +9,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 from astropy.time import Time
-from astropy.coordinates import SkyCoord, get_sun
+from astropy.coordinates import SkyCoord, get_sun, get_body_barycentric, solar_system_ephemeris
 from astropy import units as u
 import datetime
 import pandas as pd
 import pysiaf
+from scipy.interpolate import CubicSpline
 from astroquery.jplhorizons import Horizons
 from datetime import datetime, timedelta
+import re
 
+ephem = "2026/ephemeris/111/RST_EPH_PRED_LONG_2026250_2027065_01.oem"
 
 def get_radec(icrs_coords):
     """
@@ -112,6 +115,276 @@ def quat_to_radec_pa(q1, q2, q3, q4):
         pa_v3 += 2 * np.pi
 
     return np.degrees(ra), np.degrees(dec), np.degrees(pa_v3)
+
+# =============================================================================
+# 1. OEM Ephemeris Parser
+# =============================================================================
+class OEMEphemeris:
+    """
+    Parse a CCSDS OEM v2.0 file and provide interpolated spacecraft
+    position (km) in the file's reference frame (EME2000 = J2000 equatorial).
+    
+    Uses Lagrange interpolation matching the OEM metadata specification,
+    with fallback to scipy CubicSpline for convenience.
+    """
+
+    def __init__(self, filename, use_lagrange=True):
+        """
+        Parameters
+        ----------
+        filename : str
+            Path to the CCSDS OEM file.
+        use_lagrange : bool
+            If True, use Lagrange interpolation with the degree specified 
+            in the file metadata. If False, use cubic spline.
+        """
+        self.filename = filename
+        self.use_lagrange = use_lagrange
+        self.metadata = {}
+        self.times = []       # datetime objects
+        self.times_jd = []    # Julian dates (for interpolation)
+        self.positions = []   # Nx3 array of [X, Y, Z] in km
+        self.velocities = []  # Nx3 array of [VX, VY, VZ] in km/s
+        self._parse()
+        self._build_interpolators()
+
+    def _parse_oem_datetime(self, s):
+        """Parse OEM datetime string like '2026-250T11:24:00.000000'
+        (DOY format) or '2026-09-07T11:24:00.000000' (calendar format)."""
+        s = s.strip()
+        # Try DOY format: YYYY-DOYT...
+        doy_match = re.match(r'(\d{4})-(\d{3})T(.+)', s)
+        if doy_match:
+            year = int(doy_match.group(1))
+            doy = int(doy_match.group(2))
+            time_part = doy_match.group(3)
+            base = datetime(year, 1, 1) + timedelta(days=doy - 1)
+            t_parts = time_part.split(':')
+            h = int(t_parts[0])
+            m = int(t_parts[1])
+            sec = float(t_parts[2])
+            s_int = int(sec)
+            us = int((sec - s_int) * 1e6)
+            return base.replace(hour=h, minute=m, second=s_int, microsecond=us)
+        else:
+            # Try ISO calendar format
+            return datetime.fromisoformat(s)
+
+    def _parse(self):
+        """Parse the OEM file into metadata, times, positions, velocities."""
+        in_meta = False
+        in_data = False
+
+        with open(self.filename, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('COMMENT'):
+                    continue
+
+                # --- Header key-value pairs ---
+                if '=' in line and not in_meta and not in_data:
+                    key, val = line.split('=', 1)
+                    self.metadata[key.strip()] = val.strip()
+                    continue
+
+                # --- Metadata block ---
+                if line == 'META_START':
+                    in_meta = True
+                    continue
+                if line == 'META_STOP':
+                    in_meta = False
+                    in_data = True  # data follows meta block
+                    continue
+                if in_meta and '=' in line:
+                    key, val = line.split('=', 1)
+                    self.metadata[key.strip()] = val.strip()
+                    continue
+
+                # --- Data lines ---
+                if in_data:
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        dt = self._parse_oem_datetime(parts[0])
+                        self.times.append(dt)
+                        x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                        self.positions.append([x, y, z])
+                        if len(parts) >= 7:
+                            vx, vy, vz = float(parts[4]), float(parts[5]), float(parts[6])
+                            self.velocities.append([vx, vy, vz])
+
+        self.positions = np.array(self.positions)    # (N, 3) km
+        self.velocities = np.array(self.velocities)  # (N, 3) km/s
+        self.times_jd = np.array([Time(t).jd for t in self.times])
+
+        # Extract interpolation parameters from metadata
+        self.interp_degree = int(self.metadata.get('INTERPOLATION_DEGREE', 7))
+        self.ref_frame = self.metadata.get('REF_FRAME', 'EME2000')
+        self.center = self.metadata.get('CENTER_NAME', 'EARTH')
+        self.object_name = self.metadata.get('OBJECT_NAME', 'UNKNOWN')
+
+        print(f"Loaded OEM ephemeris for '{self.object_name}' "
+              f"centered on '{self.center}' in '{self.ref_frame}'")
+        print(f"  Time range: {self.times[0]} to {self.times[-1]}")
+        print(f"  {len(self.times)} data points, "
+              f"Lagrange degree {self.interp_degree}")
+
+    def _build_interpolators(self):
+        """Build cubic spline interpolators as a fallback option."""
+        self._spline_x = CubicSpline(self.times_jd, self.positions[:, 0])
+        self._spline_y = CubicSpline(self.times_jd, self.positions[:, 1])
+        self._spline_z = CubicSpline(self.times_jd, self.positions[:, 2])
+
+    def _lagrange_interp(self, t_jd, component_idx):
+        """
+        Lagrange interpolation of the specified degree, centered on the 
+        query time, for one position component.
+        
+        Parameters
+        ----------
+        t_jd : float
+            Query time as Julian Date.
+        component_idx : int
+            0=X, 1=Y, 2=Z
+            
+        Returns
+        -------
+        float
+            Interpolated value in km.
+        """
+        n = self.interp_degree + 1  # number of points needed
+
+        # Find the closest data point index
+        idx = np.searchsorted(self.times_jd, t_jd)
+
+        # Center the interpolation window
+        half = n // 2
+        i_start = idx - half
+        i_start = max(0, min(i_start, len(self.times_jd) - n))
+        i_end = i_start + n
+
+        t_pts = self.times_jd[i_start:i_end]
+        y_pts = self.positions[i_start:i_end, component_idx]
+
+        # Lagrange basis evaluation
+        result = 0.0
+        for j in range(n):
+            basis = 1.0
+            for k in range(n):
+                if k != j:
+                    basis *= (t_jd - t_pts[k]) / (t_pts[j] - t_pts[k])
+            result += y_pts[j] * basis
+
+        return result
+
+    def get_position(self, t):
+        """
+        Get interpolated spacecraft position at time t.
+        
+        Parameters
+        ----------
+        t : datetime, Time, or str
+            Query time.
+            
+        Returns
+        -------
+        np.ndarray
+            [X, Y, Z] in km, in the file's reference frame (EME2000),
+            centered on the file's center body (EARTH).
+        """
+        if isinstance(t, str):
+            t = Time(t).datetime
+        if isinstance(t, Time):
+            t = t.datetime
+
+        t_jd = Time(t).jd
+
+        # Check bounds
+        if t_jd < self.times_jd[0] or t_jd > self.times_jd[-1]:
+            raise ValueError(
+                f"Query time {t} is outside ephemeris range "
+                f"[{self.times[0]}, {self.times[-1]}]"
+            )
+
+        if self.use_lagrange:
+            x = self._lagrange_interp(t_jd, 0)
+            y = self._lagrange_interp(t_jd, 1)
+            z = self._lagrange_interp(t_jd, 2)
+        else:
+            x = float(self._spline_x(t_jd))
+            y = float(self._spline_y(t_jd))
+            z = float(self._spline_z(t_jd))
+
+        return np.array([x, y, z])  # km, EME2000 Earth-centered
+
+
+# =============================================================================
+# 2. Sun position from RST using OEM + Astropy built-in ephemeris
+# =============================================================================
+def get_sun_position_earth_centered_equatorial(t):
+    """
+    Get the Sun's position relative to Earth in J2000 equatorial (EME2000)
+    coordinates using Astropy's built-in ephemeris (no Horizons query).
+    
+    Parameters
+    ----------
+    t : datetime or Time
+        Query time.
+        
+    Returns
+    -------
+    np.ndarray
+        [X, Y, Z] in km, Sun relative to Earth, EME2000.
+    """
+    if isinstance(t, datetime):
+        t = Time(t)
+
+    with solar_system_ephemeris.set('builtin'):
+        # Barycentric positions
+        earth_bary = get_body_barycentric('earth', t)
+        sun_bary = get_body_barycentric('sun', t)
+
+    # Sun relative to Earth, in km
+    sun_rel_earth = (sun_bary - earth_bary).xyz.to(u.km).value
+    return sun_rel_earth  # [X, Y, Z] km, ICRS ≈ EME2000
+
+def get_sun_from_rst(t, oem):
+    """
+    Compute the Sun's RA, Dec as seen from RST, using the OEM ephemeris
+    for the spacecraft position instead of JPL Horizons.
+    
+    This is the drop-in replacement for get_sun_from_l2_jpl().
+    
+    Parameters
+    ----------
+    t : datetime or Time
+        Query time (UTC).
+    oem : OEMEphemeris
+        Loaded OEM ephemeris object for RST.
+        
+    Returns
+    -------
+    tuple
+        (RA_deg, Dec_deg) of the Sun as seen from RST, in J2000 equatorial.
+    """
+    if isinstance(t, Time):
+        t_dt = t.datetime
+    else:
+        t_dt = t
+
+    # RST position relative to Earth (km, EME2000) from OEM file
+    rst_earth = oem.get_position(t_dt)
+
+    # Sun position relative to Earth (km, EME2000) from Astropy
+    sun_earth = get_sun_position_earth_centered_equatorial(t_dt)
+
+    # Sun position relative to RST = Sun_Earth - RST_Earth
+    sun_rst = sun_earth - rst_earth
+
+    # Convert to RA, Dec (already in equatorial frame — no rotation needed!)
+    ra, dec = get_radec(sun_rst)
+
+    return ra, dec
+
 
 def query_jpl_horizons(target, observer, start_time, stop_time, step_size='1h'):
     epochs_time = {'start': start_time.iso, 'stop': stop_time.iso, 'step': step_size}
@@ -428,6 +701,7 @@ class RomanPointing:
         self.target_coord = None
         self.sun_coord = None
         self.pitch_limits = [-36,36]*u.deg
+        self.ephem = OEMEphemeris(ephem)
         self._update_sun_position()
 
     def _update_sun_position(self):
@@ -443,7 +717,8 @@ class RomanPointing:
         """
         # suncoord = get_sun(self.observation_date)
         # self.sun_coord = SkyCoord(ra=suncoord.ra,dec=suncoord.dec, frame='icrs')
-        ra, dec = get_sun_from_l2_jpl(self.observation_date)
+        # ra, dec = get_sun_from_l2_jpl(self.observation_date)
+        ra, dec = get_sun_from_rst(self.observation_date, self.ephem)
         self.sun_coord = SkyCoord(ra=ra,dec=dec, frame='icrs', unit='deg')
 
     def get_attitude_quaternion(self, attitude=None):
