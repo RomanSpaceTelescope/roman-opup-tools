@@ -4298,8 +4298,8 @@ def add_attitude_columns(df):
                 continue
 
             # ── Sun position from JPL for this exact time ──
-            sun_ra, sun_dec = get_sun_from_l2_jpl(obs_time)
-            # sun_ra, sun_dec = get_sun_from_rst(obs_time, oem)
+            # sun_ra, sun_dec = get_sun_from_l2_jpl(obs_time)
+            sun_ra, sun_dec = get_sun_from_rst(obs_time, oem)
             sun_coord = SkyCoord(ra=sun_ra*u.deg, dec=sun_dec*u.deg, frame='icrs')
 
             # ── Sun angle: pure geometry ──
