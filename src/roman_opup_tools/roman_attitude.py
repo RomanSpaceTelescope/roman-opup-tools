@@ -19,7 +19,7 @@ from astroquery.jplhorizons import Horizons
 from datetime import datetime, timedelta
 import re
 
-ephem = "2026/ephemeris/111/RST_EPH_PRED_LONG_2026250_2027065_01.oem"
+ephem = "RST_EPH_PRED_LONG_2026250_2027065_01.oem"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # COORDINATE CONVERSION UTILITIES
@@ -721,44 +721,70 @@ class RomanPointing:
         self.target_coord = None
         self.sun_coord = None
         self.pitch_limits = [-36,36]*u.deg
-        self.ephem = OEMEphemeris(ephem)
+
+
+            # Try to load the OEM ephemeris; fall back gracefully if missing
+        try:
+            self.ephem = OEMEphemeris(ephem)
+            self._sun_source = 'OEM'
+        except (FileNotFoundError, OSError) as e:
+            import warnings
+            warnings.warn(
+                f"OEM ephemeris file not found ({ephem}). "
+                f"Falling back to JPL Horizons for Sun position (uses JWST as L2 proxy).\n"
+                f"  Original error: {e}",
+                stacklevel=2,
+            )
+            self.ephem = None
+            self._sun_source = 'JPL'
+
         self._update_sun_position()
 
     def _update_sun_position(self):
         """
         Update Sun position for the observation date.
 
-        This method calculates the current position of the Sun based on the
-        observation date and updates the sun_coord attribute of the class.
+        Uses the OEM ephemeris + Astropy if available, otherwise falls back
+        to querying JPL Horizons (Sun as seen from JWST at L2).
 
-        Returns:
+        Updates:
         --------
-        None
+        self.sun_coord : SkyCoord
+            Sun position in ICRS.
         """
-        # suncoord = get_sun(self.observation_date)
-        # self.sun_coord = SkyCoord(ra=suncoord.ra,dec=suncoord.dec, frame='icrs')
-        # ra, dec = get_sun_from_l2_jpl(self.observation_date)
-        ra, dec = get_sun_from_rst(self.observation_date, self.ephem)
-        self.sun_coord = SkyCoord(ra=ra,dec=dec, frame='icrs', unit='deg')
+        if self.ephem is not None:
+            # Primary path: OEM ephemeris for RST position
+            ra, dec = get_sun_from_rst(self.observation_date, self.ephem)
+        else:
+            # Fallback: JPL Horizons (JWST as L2 proxy)
+            ra, dec = get_sun_from_l2_jpl(self.observation_date)
+
+        self.sun_coord = SkyCoord(ra=ra, dec=dec, frame='icrs', unit='deg')
 
     def get_attitude_quaternion(self, attitude=None):
         """
-        Get attitude as quaternion [w, x, y, z]
+        Get attitude as quaternion [x, y, z, w] (scalar-last convention).
+
+        This matches the convention used by roman_attitude() and
+        quat_to_radec_pa(), so the output can be passed directly to
+        either function.
+
         Parameters:
         -----------
-        attitude: 3x3 numpy array, optional spacecraft attitude matrix
+        attitude : 3x3 numpy array, optional
+            Spacecraft attitude matrix. If not provided, uses the
+            current spacecraft_attitude.
 
         Returns:
         --------
-        numpy array, quaternion representation of attitude
+        numpy array
+            Quaternion [x, y, z, w] (scalar-last).
         """
         if attitude is None:
             attitude = self.spacecraft_attitude
-    
-        rotation = R.from_matrix(self.spacecraft_attitude)
-        quat = rotation.as_quat()  # [x, y, z, w]
-        return np.array([quat[3], quat[0], quat[1], quat[2]])  # [w, x, y, z]
-    
+
+        rotation = R.from_matrix(attitude)
+        return rotation.as_quat()  # scipy default: [x, y, z, w] — scalar-last    
     
     
     def get_attitude_euler(self, attitude=None, sequence='ZYX', degrees=True):
