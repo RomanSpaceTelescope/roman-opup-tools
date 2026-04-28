@@ -28,7 +28,7 @@ from astropy.time import Time
 from astropy.coordinates import SkyCoord
 from astropy import units as u
 
-from roman_attitude import (
+from roman_opup_tools.roman_attitude import (
     RomanPointing,
     roman_attitude,
     quat_to_radec_pa,

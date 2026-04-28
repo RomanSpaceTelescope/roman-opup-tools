@@ -11,6 +11,10 @@ import json
 import os
 import argparse
 
+from pathlib import Path
+
+_THIS_DIR = Path(__file__).resolve().parent
+
 # ═════════════════════════════════════════════════════════════════════════════
 # DATA EMBEDDING UTILITIES
 # ═════════════════════════════════════════════════════════════════════════════
@@ -353,7 +357,7 @@ def _prepare_javascript_data(preloaded_datasets, sun_position, star_catalog_json
 
 def generate_html(preloaded_datasets=None, sun_position=None):
     """Generate standalone HTML plotter with embedded React app and data."""
-    star_catalog_json = embed_csv_as_js_array('Constellation_Stars_nolatex.csv')
+    star_catalog_json = embed_csv_as_js_array(str(_THIS_DIR / 'Constellation_Stars_nolatex.csv'))
 
     # Prepare JavaScript data strings
     preloaded_js, sun_js = _prepare_javascript_data(preloaded_datasets, sun_position, star_catalog_json)

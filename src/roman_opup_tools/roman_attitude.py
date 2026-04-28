@@ -19,7 +19,12 @@ from astroquery.jplhorizons import Horizons
 from datetime import datetime, timedelta
 import re
 
-ephem = "RST_EPH_PRED_LONG_2026250_2027065_01.oem"
+from pathlib import Path
+
+# This resolves to the directory containing opup_report.py, no matter
+# where you call `opup-report` from (home dir, /tmp, anywhere)
+_THIS_DIR = Path(__file__).resolve().parent.parent.parent
+ephem = _THIS_DIR / "RST_EPH_PRED_LONG_2026250_2027065_01.oem"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # COORDINATE CONVERSION UTILITIES
@@ -640,7 +645,7 @@ def roman_attitude(q):
     ---------
     ra, dec, pa_v3
     '''
-
+    q = np.asarray(q, dtype=float)
     x,y,z,w = q  # scalar-last
 
     # rotation matrix (ECI→BCS)
@@ -700,38 +705,40 @@ class RomanPointing:
     - Check visibility constraints
     """
 
-    def __init__(self, observation_date=None):
+    def __init__(self, observation_date=None, ephem_file=None):
         """
         Initialize spacecraft pointing system
         
         Parameters:
         -----------
-        observation_date: datetime object or astropy Time object
+        observation_date : datetime object or astropy Time object
+        ephem_file : str, optional
+            Path to OEM ephemeris file. If None, uses the module-level default.
         """
         if observation_date is None:
             self.observation_date = Time.now()
-        # elif isinstance(observation_date, datetime.datetime):
-        #     self.observation_date = Time(observation_date)
         elif isinstance(observation_date, str):
             self.observation_date = datetime.fromisoformat(observation_date)
         else:
             self.observation_date = observation_date
-            
-        self.spacecraft_attitude = np.eye(3)  # Identity rotation matrix
+
+        self.spacecraft_attitude = np.eye(3)
         self.target_coord = None
         self.sun_coord = None
-        self.pitch_limits = [-36,36]*u.deg
+        self.pitch_limits = [-36, 36] * u.deg
 
+        # Use provided path or fall back to module default
+        ephem_path = ephem_file if ephem_file is not None else ephem
 
-            # Try to load the OEM ephemeris; fall back gracefully if missing
         try:
-            self.ephem = OEMEphemeris(ephem)
+            self.ephem = OEMEphemeris(ephem_path)
             self._sun_source = 'OEM'
         except (FileNotFoundError, OSError) as e:
             import warnings
             warnings.warn(
-                f"OEM ephemeris file not found ({ephem}). "
-                f"Falling back to JPL Horizons for Sun position (uses JWST as L2 proxy).\n"
+                f"OEM ephemeris file not found ({ephem_path}). "
+                f"Falling back to JPL Horizons for Sun position "
+                f"(uses JWST as L2 proxy).\n"
                 f"  Original error: {e}",
                 stacklevel=2,
             )
@@ -739,7 +746,7 @@ class RomanPointing:
             self._sun_source = 'JPL'
 
         self._update_sun_position()
-
+        
     def _update_sun_position(self):
         """
         Update Sun position for the observation date.
@@ -1735,31 +1742,31 @@ class RomanPointing:
 
 def generate_power_law_sampling(n_points=14, range_max=36, power=3):
     """
-    Uses power law transformation for strong edge emphasis
-    Higher power = more edge clustering
+    Uses power law transformation for strong edge emphasis.
+    Higher power = more edge clustering.
     """
-    # Generate symmetric points using power transformation
     half_points = n_points // 2
-    
-    # Create points from 0 to 1, then apply power transformation
-    t = np.linspace(0, 1, half_points + 1)[1:-1]  # Exclude 0
-    
+
+    # Create half_points evenly spaced values in (0, 1]
+    # t=0 maps to the edge (range_max), t=1 maps to center (0)
+    # We exclude t=1 (center handled separately for odd n_points)
+    t = np.linspace(0, 1, half_points + 1)[:-1]  # ← keep 0, exclude 1
+
     # Apply power transformation (higher power = more edge clustering)
     transformed = t ** power
-    
+
     # Create positive side points
     pos_points = range_max - (range_max * transformed)
-    
+
     # Create negative side points (mirror)
     neg_points = -pos_points[::-1]
-    
-    # Combine, ensuring we get exactly n_points
+
+    # Combine
     if n_points % 2 == 0:
         all_points = np.concatenate([neg_points, pos_points])
     else:
-        # Add center point for odd number
         all_points = np.concatenate([neg_points, [0], pos_points])
-    
+
     return np.sort(all_points)
 
 # ═════════════════════════════════════════════════════════════════════════════

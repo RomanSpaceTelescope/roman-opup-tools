@@ -21,10 +21,18 @@ import argparse
 import html as html_module
 import json
 from astropy.coordinates import SkyCoord
-from roman_opup_tools import roman_attitude
+from . import roman_attitude
 from roman_visit_viewer.roman_visit_viewer import VisitFileParser, plot_manager
 import shutil
 import matplotlib
+
+from pathlib import Path
+
+# This resolves to the directory containing opup_report.py, no matter
+# where you call `opup-report` from (home dir, /tmp, anywhere)
+_THIS_DIR = Path(__file__).resolve().parent.parent.parent
+ephem = _THIS_DIR / "RST_EPH_PRED_LONG_2026250_2027065_01.oem"
+
 
 # Columns to make first in the output CSV file (if available)
 PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA_V1 [calc]', 'DEC_V1 [calc]', 'V3PA_V1 [calc]', 'RA_WFI_CEN [calc]', 'DEC_WFI_CEN [calc]', 'V3PA_WFI_CEN [calc]',
@@ -4292,7 +4300,19 @@ def add_attitude_columns(df):
     sun_angles = []
     pitches = []
     rolls = []
-    oem = OEMEphemeris("RST_EPH_PRED_LONG_2026250_2027065_01.oem")
+
+    try:
+        oem = OEMEphemeris(str(ephem))
+        _sun_source = 'OEM'
+    except (FileNotFoundError, OSError):
+        import warnings
+        warnings.warn(
+            f"OEM ephemeris file not found ({ephem}). "
+            f"Falling back to JPL Horizons for Sun position.",
+            stacklevel=2,
+        )
+        oem = None
+        _sun_source = 'JPL'
 
 
     for idx, row in df.iterrows():
@@ -4315,9 +4335,12 @@ def add_attitude_columns(df):
                 rolls.append(None)
                 continue
 
-            # ── Sun position from JPL for this exact time ──
-            # sun_ra, sun_dec = get_sun_from_l2_jpl(obs_time)
-            sun_ra, sun_dec = get_sun_from_rst(obs_time, oem)
+            # ── Sun position for this exact time ──
+            if oem is not None:
+                sun_ra, sun_dec = get_sun_from_rst(obs_time, oem)
+            else:
+                sun_ra, sun_dec = get_sun_from_l2_jpl(obs_time)
+
             sun_coord = SkyCoord(ra=sun_ra*u.deg, dec=sun_dec*u.deg, frame='icrs')
 
             # ── Sun angle: pure geometry ──
@@ -5362,7 +5385,7 @@ def package_report_archive(opup_stem, output_dir, generated_files=None):
         return None
     
 
-if __name__ == '__main__':
+def main():
     parser = setup_parser()
     args = parser.parse_args()
     
@@ -5438,5 +5461,7 @@ if __name__ == '__main__':
         if output_format in ['html', 'both']:
             process_OPUPs_html(opup_filepaths, output_dir, keep_GW)
 
+if __name__ == '__main__':
+    main()
 
 # %%
