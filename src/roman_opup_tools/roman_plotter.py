@@ -11,6 +11,10 @@ import json
 import os
 import argparse
 
+# ═════════════════════════════════════════════════════════════════════════════
+# DATA EMBEDDING UTILITIES
+# ═════════════════════════════════════════════════════════════════════════════
+
 def embed_csv_as_js_array(csv_filename):
     """
     Read CSV file and convert to JavaScript array for embedding
@@ -109,7 +113,10 @@ def embed_file_as_js_array(filename, sheet_name=None):
             f"Unsupported file type '{ext}' for '{filename}'. "
             f"Supported types: .csv, .xlsx, .xls"
         )
-    
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ASTRONOMICAL CALCULATIONS
+# ═════════════════════════════════════════════════════════════════════════════
 
 def get_sun_position(date=None, exclusion_radius=54, n_circle_pts=361):
     """
@@ -291,11 +298,22 @@ def parse_start_date(start_val):
 
     return None
 
+# ═════════════════════════════════════════════════════════════════════════════
+# HTML GENERATION
+# ═════════════════════════════════════════════════════════════════════════════
 
-def generate_html(preloaded_datasets=None, sun_position=None):
+def _prepare_javascript_data(preloaded_datasets, sun_position, star_catalog_json):
+    """
+    Prepare JavaScript data strings for embedding in HTML.
 
-    star_catalog_json = embed_csv_as_js_array('Constellation_Stars_nolatex.csv')
+    Args:
+        preloaded_datasets: List of dataset dictionaries
+        sun_position: Sun position dictionary
+        star_catalog_json: JSON string of star catalog
 
+    Returns:
+        tuple: (preloaded_js, sun_js) - JavaScript data strings
+    """
     # Build preloaded datasets JS
     if preloaded_datasets:
         entries = []
@@ -306,8 +324,7 @@ def generate_html(preloaded_datasets=None, sun_position=None):
         preloaded_js = "const PRELOADED_DATASETS = [" + ",\n            ".join(entries) + "];"
     else:
         preloaded_js = "const PRELOADED_DATASETS = [];"
-    
-    # Build Sun position JS
+
     # Build Sun position JS (including exclusion zone circles)
     if sun_position:
         sun_circle_eq = [{'ra': p['ra'], 'dec': p['dec']} for p in sun_position['sun_circle']]
@@ -331,6 +348,15 @@ def generate_html(preloaded_datasets=None, sun_position=None):
         )
     else:
         sun_js = "const SUN_POSITION = null;"
+
+    return preloaded_js, sun_js
+
+def generate_html(preloaded_datasets=None, sun_position=None):
+    """Generate standalone HTML plotter with embedded React app and data."""
+    star_catalog_json = embed_csv_as_js_array('Constellation_Stars_nolatex.csv')
+
+    # Prepare JavaScript data strings
+    preloaded_js, sun_js = _prepare_javascript_data(preloaded_datasets, sun_position, star_catalog_json)
 
     html_content = r"""<!DOCTYPE html>
 <html lang="en">
@@ -1275,6 +1301,107 @@ def generate_html(preloaded_datasets=None, sun_position=None):
 
     return html_content
 
+# ═════════════════════════════════════════════════════════════════════════════
+# PNG EXPORT
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_star_catalog_trace(coord_system):
+    """
+    Build Plotly trace for background star catalog.
+
+    Args:
+        coord_system: 'equatorial' or 'galactic'
+
+    Returns:
+        plotly trace object or None
+    """
+    import math
+
+    def equatorial_to_galactic(ra_deg, dec_deg):
+        ra = math.radians(ra_deg)
+        dec = math.radians(dec_deg)
+        x_eq = math.cos(dec) * math.cos(ra)
+        y_eq = math.cos(dec) * math.sin(ra)
+        z_eq = math.sin(dec)
+        T = [
+            [-0.054875539726, -0.873437108010, -0.483834985808],
+            [+0.494109453312, -0.444829589425, +0.746982251810],
+            [-0.867666135858, -0.198076386122, +0.455983795705]
+        ]
+        x_gal = T[0][0]*x_eq + T[0][1]*y_eq + T[0][2]*z_eq
+        y_gal = T[1][0]*x_eq + T[1][1]*y_eq + T[1][2]*z_eq
+        z_gal = T[2][0]*x_eq + T[2][1]*y_eq + T[2][2]*z_eq
+        b = math.degrees(math.asin(z_gal))
+        l = math.degrees(math.atan2(y_gal, x_gal))
+        if l < 0:
+            l += 360
+        return l, b
+
+    star_catalog_file = os.path.join(os.path.dirname(__file__), 'Constellation_Stars_nolatex.csv')
+    if not os.path.isfile(star_catalog_file):
+        return None
+
+    star_catalog = json.loads(embed_csv_as_js_array(star_catalog_file))
+
+    star_ras = []
+    star_decs = []
+    star_sizes = []
+    star_opacities = []
+    star_names = []
+
+    for star in star_catalog:
+        try:
+            ra = float(star.get('RA [deg]', ''))
+            dec = float(star.get('Dec [deg]', ''))
+            vmag = float(star.get('V App Mag', '5'))
+        except (ValueError, TypeError):
+            continue
+
+        star_ras.append(ra)
+        star_decs.append(dec)
+        star_sizes.append(max(2, 10 - vmag * 1.5))
+        star_opacities.append(min(0.7, 2.5 / (vmag + 2)))
+
+        name_parts = []
+        if star.get('Common Name'):
+            name_parts.append(star['Common Name'])
+        if star.get('I'):
+            name_parts.append(star['I'])
+        if star.get('V App Mag'):
+            name_parts.append(f"V={star['V App Mag']}")
+        star_names.append('<br>'.join(name_parts) if name_parts else '')
+
+    if not star_ras:
+        return None
+
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return None
+
+    if coord_system == 'equatorial':
+        s_lon = [ra - 360 if ra > 180 else ra for ra in star_ras]
+        s_lat = star_decs
+    else:
+        gal = [equatorial_to_galactic(ra, dec) for ra, dec in zip(star_ras, star_decs)]
+        s_lon = [l - 360 if l > 180 else l for l, b in gal]
+        s_lat = [b for l, b in gal]
+
+    return go.Scattergeo(
+        lon=s_lon,
+        lat=s_lat,
+        mode='markers',
+        name='Catalog Stars',
+        marker=dict(
+            size=star_sizes,
+            color='#FFFFE0',
+            opacity=star_opacities,
+            symbol='star',
+            line=dict(color='#FFFFFF', width=0.3)
+        ),
+        hoverinfo='text',
+        text=star_names
+    )
 
 def export_static_png(preloaded_datasets, output_png, coord_system='equatorial', sun_date=None):
     """
@@ -1362,65 +1489,12 @@ def export_static_png(preloaded_datasets, output_png, coord_system='equatorial',
     ]
 
     # --- Star catalog ---
-    star_catalog_file = os.path.join(os.path.dirname(__file__), 'Constellation_Stars_nolatex.csv')
-    if os.path.isfile(star_catalog_file):
-        star_catalog = json.loads(embed_csv_as_js_array(star_catalog_file))
-
-        star_ras = []
-        star_decs = []
-        star_sizes = []
-        star_opacities = []
-        star_names = []
-
-        for star in star_catalog:
-            try:
-                ra = float(star.get('RA [deg]', ''))
-                dec = float(star.get('Dec [deg]', ''))
-                vmag = float(star.get('V App Mag', '5'))
-            except (ValueError, TypeError):
-                continue
-
-            star_ras.append(ra)
-            star_decs.append(dec)
-            star_sizes.append(max(2, 10 - vmag * 1.5))
-            star_opacities.append(min(0.7, 2.5 / (vmag + 2)))
-
-            name_parts = []
-            if star.get('Common Name'):
-                name_parts.append(star['Common Name'])
-            if star.get('I'):
-                name_parts.append(star['I'])
-            if star.get('V App Mag'):
-                name_parts.append(f"V={star['V App Mag']}")
-            star_names.append('<br>'.join(name_parts) if name_parts else '')
-
-        if star_ras:
-            if coord_system == 'equatorial':
-                s_lon = [ra - 360 if ra > 180 else ra for ra in star_ras]
-                s_lat = star_decs
-            else:
-                gal = [equatorial_to_galactic(ra, dec) for ra, dec in zip(star_ras, star_decs)]
-                s_lon = [l - 360 if l > 180 else l for l, b in gal]
-                s_lat = [b for l, b in gal]
-
-            fig.add_trace(go.Scattergeo(
-                lon=s_lon,
-                lat=s_lat,
-                mode='markers',
-                name='Catalog Stars',
-                marker=dict(
-                    size=star_sizes,
-                    color='#FFFFE0',
-                    opacity=star_opacities,
-                    symbol='star',
-                    line=dict(color='#FFFFFF', width=0.3)
-                ),
-                hoverinfo='text',
-                text=star_names
-            ))
-            print(f"  ⭐ Added {len(star_ras)} catalog stars")
+    star_trace = _build_star_catalog_trace(coord_system)
+    if star_trace:
+        fig.add_trace(star_trace)
+        print(f"  ⭐ Added catalog stars")
     else:
-        print(f"  ⚠️  Star catalog not found at '{star_catalog_file}', skipping")
+        print(f"  ⚠️  Star catalog not found, skipping")
 
     # Process all preloaded datasets
     all_data = []
@@ -1618,6 +1692,10 @@ def export_static_png(preloaded_datasets, output_png, coord_system='equatorial',
 
     fig.write_image(output_png, scale=2)
     print(f"  📷 Exported PNG: '{output_png}' (3840×2160)")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# COMMAND-LINE INTERFACE
+# ═════════════════════════════════════════════════════════════════════════════
 
 def main():
     examples = """\

@@ -5,7 +5,10 @@
 # Contributors:
 # David Morgan
 
-#%%
+# ═════════════════════════════════════════════════════════════════════════════
+# IMPORTS AND CONFIGURATION
+# ═════════════════════════════════════════════════════════════════════════════
+
 import os
 from pathlib import Path
 import io
@@ -27,12 +30,10 @@ import matplotlib
 PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA_V1 [calc]', 'DEC_V1 [calc]', 'V3PA_V1 [calc]', 'RA_WFI_CEN [calc]', 'DEC_WFI_CEN [calc]', 'V3PA_WFI_CEN [calc]',
                     'Off-Normal_Roll', 'Off-Normal_Roll [calc]', 'Pitch [calc]',
                     'WFI_SCI_TABLE', 'READFRAMES', 'WFI_Optical_Element']
-#%%
 
-# ════════════════════════════════════════════════════════════════════════════
-# PART 1: Quaternion-based WFI footprint precomputation
-# Add to visit_parser.py
-# ════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 1: WFI FOOTPRINT PRECOMPUTATION
+# ═════════════════════════════════════════════════════════════════════════════
 
 import numpy as np
 import json
@@ -328,8 +329,11 @@ def add_pointing_columns(df):
     return df
 
 
-import matplotlib
 matplotlib.use('Agg')  # non-interactive backend for batch generation
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 2: SKY PLOT GENERATION
+# ═════════════════════════════════════════════════════════════════════════════
 
 def generate_sky_plot_pngs(opup_filepath, output_dir, df):
     """
@@ -2388,6 +2392,88 @@ def inject_aladin_into_html(html_content, wfi_footprints, df=None):
 
     return html_content
 
+def _prepare_visit_contents_for_report(df, opup_filepath):
+    """
+    Extract and syntax-highlight visit file contents from OPUP archive.
+
+    Args:
+        df: DataFrame containing OPUP data
+        opup_filepath: Path to the OPUP archive
+
+    Returns:
+        tuple: (visit_contents_raw_json, visit_contents_highlighted_json, visit_contents dict)
+    """
+    print("Extracting visit file contents from archive...")
+    visit_filenames = df['Visit_File_Name'].dropna().unique().tolist()
+    visit_contents = get_all_visit_contents(opup_filepath, visit_filenames)
+    print(f"Extracted {len(visit_contents)} visit files")
+
+    print("Applying syntax highlighting...")
+    visit_contents_highlighted = {}
+    for filename, content in visit_contents.items():
+        visit_contents_highlighted[filename] = syntax_highlight_visit_content(content)
+
+    visit_contents_raw_json = json.dumps(visit_contents)
+    visit_contents_highlighted_json = json.dumps(visit_contents_highlighted)
+
+    return visit_contents_raw_json, visit_contents_highlighted_json, visit_contents
+
+def _calculate_report_statistics(df):
+    """
+    Calculate summary statistics for the HTML report.
+
+    Args:
+        df: DataFrame containing OPUP data
+
+    Returns:
+        dict: Dictionary containing all calculated statistics
+    """
+    stats = {
+        'total_rows': len(df),
+        'total_cols': len(df.columns),
+        'unique_visits': df['Visit_ID'].nunique() if 'Visit_ID' in df.columns else 0,
+        'unique_sci_ids': df['SCI_ID'].nunique() if 'SCI_ID' in df.columns else 0,
+        'unique_programs': 0,
+        'unique_passes': 0,
+        'unique_segments': 0,
+        'unique_observations': 0,
+        'total_duration_seconds': 0,
+        'total_duration_display': "N/A"
+    }
+
+    # Calculate hierarchical counts
+    if 'Visit_ID' in df.columns:
+        unique_visits_df = df.drop_duplicates(subset=['Visit_ID'])
+
+        if 'Program_Number' in unique_visits_df.columns:
+            stats['unique_programs'] = unique_visits_df['Program_Number'].nunique()
+
+        if 'Program_Number' in unique_visits_df.columns and 'Pass_Number' in unique_visits_df.columns:
+            stats['unique_passes'] = unique_visits_df[['Program_Number', 'Pass_Number']].drop_duplicates().shape[0]
+
+        if all(col in unique_visits_df.columns for col in ['Program_Number', 'Pass_Number', 'Segment_Number']):
+            stats['unique_segments'] = unique_visits_df[['Program_Number', 'Pass_Number', 'Segment_Number']].drop_duplicates().shape[0]
+
+        if all(col in unique_visits_df.columns for col in ['Program_Number', 'Pass_Number', 'Segment_Number', 'Observation_Number']):
+            stats['unique_observations'] = unique_visits_df[['Program_Number', 'Pass_Number', 'Segment_Number', 'Observation_Number']].drop_duplicates().shape[0]
+
+        # Calculate total duration
+        if 'Duration' in df.columns:
+            try:
+                durations = pd.to_numeric(unique_visits_df['Duration'], errors='coerce')
+                total_duration_seconds = durations.sum()
+
+                if pd.notna(total_duration_seconds) and total_duration_seconds > 0:
+                    hours = int(total_duration_seconds // 3600)
+                    minutes = int((total_duration_seconds % 3600) // 60)
+                    seconds = int(total_duration_seconds % 60)
+                    stats['total_duration_seconds'] = total_duration_seconds
+                    stats['total_duration_display'] = f"{hours}h {minutes}m {seconds}s"
+            except Exception as e:
+                print(f"Error calculating duration: {e}")
+
+    return stats
+
 def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map=None, skyplot_mosaic_filename=None):
     """
     Generate HTML content with hyperlinks to visit files and horizontal scrolling.
@@ -2408,89 +2494,21 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
     if skyplot_mosaic_filename is None:
         skyplot_mosaic_filename = ''
 
-    
-    # Extract all visit file contents
-    print("Extracting visit file contents from archive...")
-    visit_filenames = df['Visit_File_Name'].dropna().unique().tolist()
-    visit_contents = get_all_visit_contents(opup_filepath, visit_filenames)
-    print(f"Extracted {len(visit_contents)} visit files")
-    
-    # Apply syntax highlighting to each visit file
-    print("Applying syntax highlighting...")
-    visit_contents_highlighted = {}
-    for filename, content in visit_contents.items():
-        visit_contents_highlighted[filename] = syntax_highlight_visit_content(content)
-    
-    # Convert to JSON for embedding (store both raw and highlighted)
-    visit_contents_raw_json = json.dumps(visit_contents)
-    visit_contents_highlighted_json = json.dumps(visit_contents_highlighted)
-    
-    # Calculate statistics - MUST BE BEFORE HTML STRING STARTS
-    total_rows = len(df)
-    total_cols = len(df.columns)
-    unique_visits = df['Visit_ID'].nunique() if 'Visit_ID' in df.columns else 0
-    unique_sci_ids = df['SCI_ID'].nunique() if 'SCI_ID' in df.columns else 0
-    
-    # Calculate program/pass/segment/observation counts
-    # These are hierarchical, so we need to count unique combinations
-    # Use unique visits to avoid counting duplicates from multiple exposures
-    if 'Visit_ID' in df.columns:
-        unique_visits_df = df.drop_duplicates(subset=['Visit_ID'])
-        
-        # Programs: Count unique program numbers
-        unique_programs = unique_visits_df['Program_Number'].nunique() if 'Program_Number' in unique_visits_df.columns else 0
-        
-        # Passes: Count unique (Program, Pass) combinations
-        if 'Program_Number' in unique_visits_df.columns and 'Pass_Number' in unique_visits_df.columns:
-            unique_passes = unique_visits_df[['Program_Number', 'Pass_Number']].drop_duplicates().shape[0]
-        else:
-            unique_passes = 0
-        
-        # Segments: Count unique (Program, Pass, Segment) combinations
-        if all(col in unique_visits_df.columns for col in ['Program_Number', 'Pass_Number', 'Segment_Number']):
-            unique_segments = unique_visits_df[['Program_Number', 'Pass_Number', 'Segment_Number']].drop_duplicates().shape[0]
-        else:
-            unique_segments = 0
-        
-        # Observations: Count unique (Program, Pass, Segment, Observation) combinations
-        if all(col in unique_visits_df.columns for col in ['Program_Number', 'Pass_Number', 'Segment_Number', 'Observation_Number']):
-            unique_observations = unique_visits_df[['Program_Number', 'Pass_Number', 'Segment_Number', 'Observation_Number']].drop_duplicates().shape[0]
-        else:
-            unique_observations = 0
-    else:
-        unique_programs = 0
-        unique_passes = 0
-        unique_segments = 0
-        unique_observations = 0
-    
-    # Calculate total duration - ONLY count once per visit, not per exposure
-    total_duration_seconds = 0
-    total_duration_display = "N/A"
-    if 'Duration' in df.columns and 'Visit_ID' in df.columns:
-        try:
-            # Reuse unique_visits_df if already created
-            if 'unique_visits_df' not in locals():
-                unique_visits_df = df.drop_duplicates(subset=['Visit_ID'])
-            # Convert to numeric, coercing errors to NaN
-            durations = pd.to_numeric(unique_visits_df['Duration'], errors='coerce')
-            total_duration_seconds = durations.sum()
-            
-            # Only create display string if we have valid data
-            if pd.notna(total_duration_seconds) and total_duration_seconds > 0:
-                # Convert to hours, minutes, seconds
-                hours = int(total_duration_seconds // 3600)
-                minutes = int((total_duration_seconds % 3600) // 60)
-                seconds = int(total_duration_seconds % 60)
-                total_duration_display = f"{hours}h {minutes}m {seconds}s"
-            else:
-                total_duration_seconds = 0
-                total_duration_display = "N/A"
-        except Exception as e:
-            print(f"Error calculating duration: {e}")
-            total_duration_seconds = 0
-            total_duration_display = "N/A"
-    
+    # Prepare visit file contents
+    visit_contents_raw_json, visit_contents_highlighted_json, visit_contents = _prepare_visit_contents_for_report(df, opup_filepath)
 
+    # Calculate statistics
+    stats = _calculate_report_statistics(df)
+    total_rows = stats['total_rows']
+    total_cols = stats['total_cols']
+    unique_visits = stats['unique_visits']
+    unique_sci_ids = stats['unique_sci_ids']
+    unique_programs = stats['unique_programs']
+    unique_passes = stats['unique_passes']
+    unique_segments = stats['unique_segments']
+    unique_observations = stats['unique_observations']
+    total_duration_seconds = stats['total_duration_seconds']
+    total_duration_display = stats['total_duration_display']
 
     # Start HTML document
     html = f"""<!DOCTYPE html>
@@ -4532,7 +4550,10 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, gen
     
     return html_report, sky_plotter_html, full_csv, archive_path
 
-# Add HTML option to command-line parser
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 7: COMMAND-LINE INTERFACE
+# ═════════════════════════════════════════════════════════════════════════════
+
 def setup_parser_with_html():
     parser = argparse.ArgumentParser(description='Parse OPUP files.')
     parser.add_argument('-opup', '--opup_filepath', type=str, nargs='+', help='Path(s) to the OPUP file(s)', default=[])
