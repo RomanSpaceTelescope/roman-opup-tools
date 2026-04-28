@@ -22,9 +22,15 @@ import html as html_module
 import json
 from astropy.coordinates import SkyCoord
 from . import roman_attitude
-from roman_visit_viewer.roman_visit_viewer import VisitFileParser, plot_manager
+# from roman_visit_viewer.roman_visit_viewer import VisitFileParser, plot_manager
 import shutil
 import matplotlib
+import textwrap
+from roman_opup_tools.roman_attitude import RomanPointing, OEMEphemeris, get_sun_from_l2_jpl, get_sun_from_rst
+from astropy.time import Time
+from astropy.coordinates import SkyCoord
+from astropy import units as u
+
 
 from pathlib import Path
 
@@ -4278,6 +4284,33 @@ def get_pitch_and_roll(ra, dec, v3pa, obs_time):
         'actual_v3pa': v3pa
     }
 
+
+# ── Module-level OEM cache ──
+_oem_cache = {}          # keyed by resolved ephemeris path string
+
+
+def _get_oem(ephem):
+    """
+    Return a cached OEMEphemeris object for the given path.
+    Loads it only on first call; subsequent calls with the same
+    path return the cached instance.
+    """
+    key = str(ephem)
+    if key not in _oem_cache:
+        try:
+            _oem_cache[key] = OEMEphemeris(key)
+            _oem_cache[key]._already_printed = True  # suppress future prints
+
+        except (FileNotFoundError, OSError):
+            import warnings
+            warnings.warn(
+                f"OEM ephemeris file not found ({ephem}). "
+                f"Falling back to JPL Horizons for Sun position.",
+                stacklevel=2,
+            )
+            _oem_cache[key] = None
+    return _oem_cache[key]
+
 def add_attitude_columns(df):
     """
     Add Sun_Angle, Pitch, and Off-Nominal_Roll columns to the DataFrame.
@@ -4288,21 +4321,13 @@ def add_attitude_columns(df):
         print(f"  ⚠️  Cannot compute attitude columns — missing: {missing}")
         return df
     
-    try:
-        from roman_opup_tools.roman_attitude import RomanPointing, OEMEphemeris, get_sun_from_l2_jpl, get_sun_from_rst
-        from astropy.time import Time
-        from astropy.coordinates import SkyCoord
-        from astropy import units as u
-    except ImportError:
-        print("  ⚠️  roman_attitude not available — skipping attitude columns")
-        return df
-
     sun_angles = []
     pitches = []
     rolls = []
 
     try:
-        oem = OEMEphemeris(str(ephem))
+        oem = _get_oem(ephem)
+        rp = RomanPointing(observation_date="2026-09-07 11:24:00",ephem_file=ephem)
         _sun_source = 'OEM'
     except (FileNotFoundError, OSError):
         import warnings
@@ -4322,48 +4347,42 @@ def add_attitude_columns(df):
             rolls.append(None)
             continue
 
-        try:
-            ra = float(row['RA'])
-            dec = float(row['DEC'])
-            v3pa = float(row['Position_Angle'])
-            start_str = str(row['Start']).strip()
+        ra = float(row['RA'])
+        dec = float(row['DEC'])
+        v3pa = float(row['Position_Angle'])
+        start_str = str(row['Start']).strip()
 
-            obs_time = _parse_obs_time(start_str)
-            if obs_time is None:
-                sun_angles.append(None)
-                pitches.append(None)
-                rolls.append(None)
-                continue
-
-            # ── Sun position for this exact time ──
-            if oem is not None:
-                sun_ra, sun_dec = get_sun_from_rst(obs_time, oem)
-            else:
-                sun_ra, sun_dec = get_sun_from_l2_jpl(obs_time)
-
-            sun_coord = SkyCoord(ra=sun_ra*u.deg, dec=sun_dec*u.deg, frame='icrs')
-
-            # ── Sun angle: pure geometry ──
-            target = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame='icrs')
-            sun_angle = sun_coord.separation(target).deg
-
-            # ── Pitch ──
-            pitch_val = sun_angle - 90.0
-
-            # ── Roll: fresh RomanPointing for this exact time ──
-            rp = RomanPointing(observation_date=obs_time)
-            rp.set_target_using_radec(ra, dec, roll=0.0)
-            nominal_v3pa = rp.get_position_angle()
-            roll_val = (v3pa - nominal_v3pa.value + 180) % 360 - 180
-
-            sun_angles.append(round(sun_angle, 2))
-            pitches.append(round(pitch_val, 2))
-            rolls.append(round(roll_val, 2))
-
-        except Exception as e:
+        obs_time = _parse_obs_time(start_str)
+        if obs_time is None:
             sun_angles.append(None)
             pitches.append(None)
             rolls.append(None)
+            continue
+
+        # ── Sun position for this exact time ──
+        if oem is not None:
+            sun_ra, sun_dec = get_sun_from_rst(obs_time, oem)
+        else:
+            sun_ra, sun_dec = get_sun_from_l2_jpl(obs_time)
+
+        sun_coord = SkyCoord(ra=sun_ra*u.deg, dec=sun_dec*u.deg, frame='icrs')
+
+        # ── Sun angle: pure geometry ──
+        target = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame='icrs')
+        sun_angle = sun_coord.separation(target).deg
+
+        # ── Pitch ──
+        pitch_val = sun_angle - 90.0
+
+        # ── Roll: fresh RomanPointing for this exact time ──
+        rp._update_observation_date(observation_date=obs_time)
+        rp.set_target_using_radec(ra, dec, roll=0.0)
+        nominal_v3pa = rp.get_position_angle()
+        roll_val = (v3pa - nominal_v3pa.value + 180) % 360 - 180
+
+        sun_angles.append(round(sun_angle, 2))
+        pitches.append(round(pitch_val, 2))
+        rolls.append(round(roll_val, 2))
 
     df['Sun_Angle [calc]'] = sun_angles
     df['Pitch [calc]'] = pitches
@@ -5384,6 +5403,75 @@ def package_report_archive(opup_stem, output_dir, generated_files=None):
         print(f"  ⚠️  Failed to create archive: {e}")
         return None
     
+def setup_parser():
+    parser = argparse.ArgumentParser(
+        prog='opup_report',
+        description='OPUP Report Generator — Parse and visualize OPUP observation packages.',
+        epilog=textwrap.dedent("""\
+            output formats:
+              integrated  Full HTML report + sky plotter + CSV + archive per OPUP (default)
+              csv         CSV output only for OPUP, SCF, and visit files
+              html        Standalone HTML report only for OPUP files
+              both        Both CSV and HTML outputs
+
+            examples:
+              # Basic integrated report for a single OPUP (default mode)
+              opup_report -opup my_observation_opup.tgz
+
+              # Process a single OPUP with custom output directory
+              opup_report -opup my_observation_opup.tgz -odir ./reports/
+
+              # Process multiple OPUP files
+              opup_report -opup opup_001.tgz opup_002.tgz opup_003.tgz
+
+              # Batch process all OPUPs in a directory (with aggregation + Gantt)
+              opup_report -opup_dir /path/to/opup_folder/ -odir ./output/
+
+              # Generate only CSV output (legacy mode)
+              opup_report -opup my_opup.tgz --format csv
+
+              # Generate both CSV and HTML (legacy mode)
+              opup_report -opup my_opup.tgz --format both
+
+              # Include Guide Window columns in CSV output
+              opup_report -opup my_opup.tgz --keep_GW
+
+              # Generate sky plot PNGs (slower) in addition to integrated report
+              opup_report -opup my_opup.tgz --pngs
+
+              # Process SCF and visit files alongside OPUPs (legacy mode)
+              opup_report -opup my_opup.tgz -scf SCF_001.scf -visit V01001001001.vis --format csv
+
+              # Generate Gantt chart from a previously-created aggregated CSV
+              opup_report --gantt aggregated_opups_20260428_143022.csv -odir ./charts/
+
+              # Directory mode with CSV-only output
+              opup_report -opup_dir /path/to/opup_folder/ --format csv
+        """),
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument('-opup', '--opup_filepath', type=str, nargs='+',
+                        help='Path(s) to the OPUP .tgz archive file(s)', default=[])
+    parser.add_argument('-opup_dir', '--opup_directory', type=str,
+                        help='Directory containing OPUP .tgz archives (will process all found recursively)',
+                        default=None)
+    parser.add_argument('-scf', '--scf_filepath', type=str, nargs='+',
+                        help='Path(s) to the SCF file(s) (used in csv/html/both modes)', default=[])
+    parser.add_argument('-visit', '--visit_filepath', type=str, nargs='+',
+                        help='Path(s) to the visit file(s) (used in csv/html/both modes)', default=[])
+    parser.add_argument('-odir', '--output_dir', type=str,
+                        help='Output directory (default: same directory as input file)', default=None)
+    parser.add_argument('--keep_GW', action='store_true',
+                        help='Keep Guide Window columns in CSV output (default: separated to _GWInfo.csv)')
+    parser.add_argument('--pngs', action='store_true', default=False,
+                        help='Generate sky plot PNGs via roman_visit_viewer (slower, off by default)')
+    parser.add_argument('--gantt', type=str,
+                        help='Generate Gantt chart directly from an aggregated CSV file (skips OPUP parsing)')
+    parser.add_argument('--format', type=str, choices=['csv', 'html', 'both', 'integrated'],
+                        default='integrated',
+                        help='Output format (default: integrated)')
+    return parser
 
 def main():
     parser = setup_parser()

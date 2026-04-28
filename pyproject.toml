@@ -24,6 +24,9 @@ dev = [
     "pytest>=7",
 ]
 
+[project.scripts]
+opup-report = "roman_opup_tools.opup_report:main"
+
 [project.urls]
 Repository = "https://github.com/RomanSpaceTelescope/roman-opup-tools"
 

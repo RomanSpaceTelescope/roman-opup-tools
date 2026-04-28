@@ -746,7 +746,13 @@ class RomanPointing:
             self._sun_source = 'JPL'
 
         self._update_sun_position()
-        
+
+    def _update_observation_date(self,observation_date):
+
+        self.observation_date = observation_date
+        self._update_sun_position()
+    
+
     def _update_sun_position(self):
         """
         Update Sun position for the observation date.
