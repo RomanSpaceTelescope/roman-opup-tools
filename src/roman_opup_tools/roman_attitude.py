@@ -728,20 +728,24 @@ class RomanPointing:
         self.pitch_limits = [-36, 36] * u.deg
 
         # Use provided path or fall back to module default
-        ephem_path = ephem_file if ephem_file is not None else ephem
+        ephem_path = ephem_file if ephem_file is not None else None
 
-        try:
-            self.ephem = OEMEphemeris(ephem_path)
-            self._sun_source = 'OEM'
-        except (FileNotFoundError, OSError) as e:
-            import warnings
-            warnings.warn(
-                f"OEM ephemeris file not found ({ephem_path}). "
-                f"Falling back to JPL Horizons for Sun position "
-                f"(uses JWST as L2 proxy).\n"
-                f"  Original error: {e}",
-                stacklevel=2,
-            )
+        if ephem_file is not None:
+            try:
+                self.ephem = OEMEphemeris(ephem_path)
+                self._sun_source = 'OEM'
+            except (FileNotFoundError, OSError) as e:
+                import warnings
+                warnings.warn(
+                    f"OEM ephemeris file not found ({ephem_path}). "
+                    f"Falling back to JPL Horizons for Sun position "
+                    f"(uses JWST as L2 proxy).\n"
+                    f"  Original error: {e}",
+                    stacklevel=2,
+                )
+                self.ephem = None
+                self._sun_source = 'JPL'
+        else:
             self.ephem = None
             self._sun_source = 'JPL'
 
