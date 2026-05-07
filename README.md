@@ -1,28 +1,32 @@
+# OPUP Report Generator
 
-# OPUP Visit Parser
-
-A Python tool for parsing NASA Roman Space Telescope OPUP (Observation Plan Upload) files and generating interactive HTML reports with sky plots and visit file syntax highlighting.
+A Python tool for parsing NASA Roman Space Telescope OPUP (Observation Plan Upload) files and generating integrated HTML reports with sky plots, Gantt charts, visit file syntax highlighting, and aggregated CSV exports.
 
 ## 🎯 Overview
 
-The OPUP Visit Parser extracts observation data from compressed OPUP archives (`.tar.gz`), SCF (Spacecraft File) files, and individual visit files (`.vst`). It generates:
+The OPUP Report Generator extracts observation data from compressed OPUP archives (`.tgz`), SCF (Spacecraft File) files, and individual visit files (`.vis`). It generates:
 
-- **Interactive HTML tables** with exposure metadata
+- **Integrated HTML reports** with exposure metadata, sky plots, and visit file viewer
 - **Sky plots** showing target positions and Sun avoidance zones
+- **Gantt charts** for multi-OPUP scheduling visualization
 - **Syntax-highlighted visit files** with clickable links
 - **Statistics dashboards** with instrument breakdowns
 - **CSV exports** for further analysis
+- **Aggregated outputs** when processing multiple OPUPs
 
 ## ✨ Features
 
 - 📦 **Multiple input formats**: OPUP archives, SCF files, or individual visit files
+- 📁 **Directory batch processing**: Recursively find and process all OPUPs in a folder
 - 🌌 **Interactive sky visualization**: Auto-generated sky plots with target positions
+- 📅 **Gantt chart generation**: Timeline visualization of observation schedules
 - 🎨 **STOL syntax highlighting**: Color-coded visit file display with VS Code dark theme
 - 📊 **Statistics dashboard**: Visit counts, exposure totals, duration summaries
 - 🔗 **Clickable visit links**: View raw visit file contents directly from HTML table
 - 📈 **Instrument breakdown**: Per-instrument statistics and duration calculations
 - 🌞 **Sun avoidance zones**: Automatic Sun position calculation for visit dates
-- 💾 **Flexible output**: CSV, HTML, or both formats
+- 💾 **Flexible output**: Integrated (default), CSV, HTML, or both formats
+- 📸 **Optional PNG sky plots**: Generate static sky plot images via `roman_visit_viewer`
 
 ## 🚀 Installation
 
@@ -34,68 +38,88 @@ pip install pandas numpy argparse pathlib
 
 ### Optional Dependencies (for sky plotting)
 
-The tool can generate sky plots if `roman_plotter.py` is present in the same directory.
+The tool can generate sky plots if `roman_plotter.py` is present in the same directory. For PNG generation, `roman_visit_viewer` must also be available.
 
 ## 📖 Usage
 
 ### Basic Command Line
 
 ```bash
-# Parse OPUP file(s)
-python visit_parser.py -opup path/to/opup_file.tar.gz
+# Basic integrated report for a single OPUP (default mode)
+opup-report -opup my_observation_opup.tgz
 
-# Parse SCF file(s)
-python visit_parser.py -scf path/to/scf_file.tar.gz
+# Process a single OPUP with custom output directory
+opup-report -opup my_observation_opup.tgz -odir ./reports/
 
-# Parse individual visit file(s)
-python visit_parser.py -visit path/to/visit_file.vst
+# Process multiple OPUP files
+opup-report -opup opup_001.tgz opup_002.tgz opup_003.tgz
 
-# Multiple inputs
-python visit_parser.py -opup file1.tar.gz file2.tar.gz -scf scf1.tar.gz
+# Batch process all OPUPs in a directory (with aggregation + Gantt)
+opup-report -opup_dir /path/to/opup_folder/ -odir ./output/
+
+# Generate only CSV output (legacy mode)
+opup-report -opup my_opup.tgz --format csv
+
+# Generate both CSV and HTML (legacy mode)
+opup-report -opup my_opup.tgz --format both
+
+# Include Guide Window columns in CSV output
+opup-report -opup my_opup.tgz --keep_GW
+
+# Generate sky plot PNGs (slower) in addition to integrated report
+opup-report -opup my_opup.tgz --pngs
+
+# Process SCF and visit files alongside OPUPs (legacy mode)
+opup-report -opup my_opup.tgz -scf SCF_001.scf -visit V01001001001.vis --format csv
+
+# Generate Gantt chart from a previously-created aggregated CSV
+opup-report --gantt aggregated_opups_20260428_143022.csv -odir ./charts/
+
+# Directory mode with CSV-only output
+opup-report -opup_dir /path/to/opup_folder/ --format csv
 ```
 
 ### Command Line Arguments
 
 | Argument | Short | Description | Default |
 |----------|-------|-------------|---------|
-| `--opup_filepath` | `-opup` | Path(s) to OPUP file(s) | `[]` |
-| `--scf_filepath` | `-scf` | Path(s) to SCF file(s) | `[]` |
-| `--visit_filepath` | `-visit` | Path(s) to visit file(s) | `[]` |
-| `--output_dir` | `-odir` | Output file directory | Same as input |
-| `--keep_GW` | | Keep Guide Window information | `False` |
-| `--format` | | Output format: `csv`, `html`, or `both` | `html` |
+| `--opup_filepath` | `-opup` | Path(s) to OPUP `.tgz` archive file(s) | `[]` |
+| `--opup_directory` | `-opup_dir` | Directory containing OPUP `.tgz` archives (recursive) | `None` |
+| `--scf_filepath` | `-scf` | Path(s) to SCF file(s) (used in csv/html/both modes) | `[]` |
+| `--visit_filepath` | `-visit` | Path(s) to visit file(s) (used in csv/html/both modes) | `[]` |
+| `--output_dir` | `-odir` | Output directory | Same as input |
+| `--keep_GW` | | Keep Guide Window columns in CSV output (default: separated to `_GWInfo.csv`) | `False` |
+| `--pngs` | | Generate sky plot PNGs via `roman_visit_viewer` (slower) | `False` |
+| `--gantt` | | Generate Gantt chart directly from an aggregated CSV file (skips OPUP parsing) | `None` |
+| `--format` | | Output format: `integrated`, `csv`, `html`, or `both` | `integrated` |
 
-### Examples
+### Output Formats
 
-```bash
-# Generate both CSV and HTML outputs
-python visit_parser.py -opup my_observations.tar.gz --format both
-
-# Specify custom output directory
-python visit_parser.py -opup obs.tar.gz -odir ./results/
-
-# Keep guide window data
-python visit_parser.py -visit visit_001.vst --keep_GW
-
-# HTML only (default)
-python visit_parser.py -scf spacecraft_file.tar.gz
-```
+| Format | Description |
+|--------|-------------|
+| `integrated` | Full HTML report + interactive sky plotter + CSV + output archive per OPUP **(default)** |
+| `csv` | CSV output only for OPUP, SCF, and visit files |
+| `html` | Standalone HTML report only for OPUP files |
+| `both` | Both CSV and HTML outputs |
 
 ## 📂 Input File Formats
 
-### OPUP Archive (`.tar.gz`)
+### OPUP Archive (`.tgz`)
+
 Compressed archive containing:
 - SCF files (spacecraft files)
-- Visit files (`.vst`)
+- Visit files (`.vis`)
 - Manifest files (`.man`)
 - Observation definition files (`.json`)
 
-### SCF Archive (`.tar.gz`)
+### SCF Files (`.scf`)
+
 Contains visit files and operation files:
-- Visit files (`.vst`)
+- Visit files (`.vis`)
 - Operation files (`.ops`)
 
-### Visit Files (`.vst`)
+### Visit Files (`.vis`)
+
 STOL (Spacecraft Test and Operations Language) formatted files containing:
 - Visit metadata
 - Group/sequence/activity hierarchy
@@ -103,16 +127,23 @@ STOL (Spacecraft Test and Operations Language) formatted files containing:
 
 ## 📊 Output Files
 
-### HTML Report (`*_report.html`)
-Interactive report featuring:
-- Filterable/sortable data table
-- Clickable visit file names
+### Integrated Report (default mode)
+
+For each OPUP processed:
+- Interactive HTML report with filterable/sortable data table
 - Embedded visit file viewer with syntax highlighting
-- Statistics dashboard
-- Instrument breakdown
-- Links to sky plotter
+- Interactive sky plotter (HTML)
+- CSV export with full exposure metadata
+- Statistics dashboard with instrument breakdown
+- Output archive (`.tgz`) bundling all deliverables
+
+For directory/multi-OPUP mode:
+- All individual OPUP outputs above
+- Aggregated CSV across all OPUPs
+- Gantt chart visualization
 
 ### Sky Plotter (`*_skyplot.html`)
+
 Interactive celestial sphere visualization showing:
 - Target positions (RA/Dec)
 - Sun position and avoidance zones
@@ -120,8 +151,18 @@ Interactive celestial sphere visualization showing:
 - Ecliptic plane
 
 ### CSV Files
+
 - `*_csv.csv` - Full exposure metadata
+- `*_GWInfo.csv` - Guide Window information (separated by default)
 - `*_skyplot.csv` - Unique visit positions for plotting
+- `aggregated_opups_*.csv` - Combined data from multi-OPUP runs
+
+### Gantt Chart
+
+Timeline visualization showing:
+- Observation scheduling across multiple OPUPs
+- Visit durations and overlaps
+- Generated from aggregated CSV data
 
 ## 🎨 Syntax Highlighting
 
@@ -157,20 +198,28 @@ Plus many more instrument-specific parameters extracted from visit files.
 ## 🔧 Key Functions
 
 ### Parsing Functions
+
 - `parse_OPUP()` - Parse entire OPUP archive
 - `parse_SCF()` - Parse SCF file
 - `parse_visit_file()` - Parse individual visit file
 - `parse_visit_lines()` - Parse STOL syntax
 
 ### HTML Generation
+
 - `generate_html_report()` - Create interactive HTML table
 - `syntax_highlight_visit_content()` - Apply STOL syntax highlighting
 - `export_unique_visits_for_plotter()` - Generate sky plotter data
 
 ### Archive Utilities
+
 - `get_SCF_from_OPUP()` - Extract SCF files from OPUP
 - `get_visits_from_SCF()` - Extract visit files from SCF
 - `get_visit_content()` - Read visit file from archive
+
+### Visualization
+
+- `generate_gantt_chart()` - Create Gantt chart from aggregated data
+- Sky plot generation via `roman_plotter.py` / `roman_visit_viewer`
 
 ## 🌐 Integration with Sky Plotter
 
@@ -183,24 +232,28 @@ When `roman_plotter.py` is available, the tool automatically:
    - Clickable visit markers
 4. Cross-links between data table and sky plot
 
+When `--pngs` is specified and `roman_visit_viewer` is available, static PNG sky plots are also generated.
+
 ## 🐛 Troubleshooting
 
-**Issue**: No columns returned for visit file  
-**Solution**: Check that visit file contains valid STOL syntax with exposure commands
-
-**Issue**: Sky plotter not generated  
-**Solution**: Ensure `roman_plotter.py` is in the same directory
-
-**Issue**: Visit file content not displaying  
-**Solution**: Verify OPUP archive structure and visit file paths
+| Issue | Solution |
+|-------|----------|
+| No columns returned for visit file | Check that visit file contains valid STOL syntax with exposure commands |
+| Sky plotter not generated | Ensure `roman_plotter.py` is in the same directory |
+| Visit file content not displaying | Verify OPUP archive structure and visit file paths |
+| Gantt chart not generated | Ensure aggregated CSV has required columns (Visit_ID, start/end times) |
+| `--pngs` not producing output | Ensure `roman_visit_viewer` is installed and accessible |
 
 ## 📝 Notes
 
 - Designed for NASA Roman Space Telescope observation planning files
-- Handles nested `.tar.gz` archives automatically
+- Handles nested `.tgz` archives automatically
 - Supports both day-of-year and standard date formats
 - Automatically prioritizes important columns in output
 - Calculates visit durations and instrument statistics
+- Guide Window data is separated to `_GWInfo.csv` by default (use `--keep_GW` to include)
+- Directory mode (`-opup_dir`) recursively discovers all `.tgz` files
+- The `--gantt` flag allows regenerating Gantt charts without re-parsing OPUPs
 
 ## 🤝 Contributing
 
@@ -212,4 +265,6 @@ NASA Open Source - Internal Use
 
 ---
 
-**Last Updated**: 2026-03-31  
+*Last Updated: 2026-05-07*
+
+

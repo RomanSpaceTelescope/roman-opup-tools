@@ -16,7 +16,6 @@ dependencies = [
     "pandas>=2.1",
     "pysiaf>=0.22",
     "scipy>=1.11",
-    "roman-visit-viewer @ git+https://github.com/Skyhawk172/roman_visit_viewer.git@main",
 ]
 
 [project.optional-dependencies]
