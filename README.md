@@ -36,10 +36,6 @@ The OPUP Report Generator extracts observation data from compressed OPUP archive
 pip install pandas numpy argparse pathlib
 ```
 
-### Optional Dependencies (for sky plotting)
-
-The tool can generate sky plots if `roman_plotter.py` is present in the same directory. For PNG generation, `roman_visit_viewer` must also be available.
-
 ## 📖 Usage
 
 ### Basic Command Line
