@@ -29,8 +29,7 @@ The OPUP Report Generator extracts observation data from compressed OPUP archive
 - 📸 **Optional PNG sky plots**: Generate static sky plot images via `roman_visit_viewer`
 
 ## 🚀 Installation
-
-### Requirements
+Navigate to the root of the repo and type:
 
 ```bash
 pip install -e .
