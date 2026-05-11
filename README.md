@@ -4,7 +4,7 @@ A Python tool for parsing NASA Roman Space Telescope OPUP (Observation Plan Uplo
 
 ## 🎯 Overview
 
-The OPUP Report Generator extracts observation data from compressed OPUP archives (`.tgz`), SCF (Spacecraft File) files, and individual visit files (`.vis`). It generates:
+The OPUP Report Generator extracts observation data from compressed OPUP archives (`.tgz`), SCF (Spacecraft File) files, and individual visit files (`.vst`). It generates:
 
 - **Integrated HTML reports** with exposure metadata, sky plots, and visit file viewer
 - **Sky plots** showing target positions and Sun avoidance zones
