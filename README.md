@@ -33,7 +33,7 @@ The OPUP Report Generator extracts observation data from compressed OPUP archive
 ### Requirements
 
 ```bash
-pip install pandas numpy argparse pathlib
+pip install -e .
 ```
 
 ## 📖 Usage
