@@ -411,8 +411,16 @@ def get_position(target, observer, start_time, stop_time):
 def get_sun_from_l2_jpl(t):
     target = '10'
     observer = '@jwst' # no Roman yet, so using JWST as other known object at L2
-    start_time = t
-    stop_time = t+timedelta(days=1)
+
+    # Ensure we have a Time object for consistent handling
+    if isinstance(t, str):
+        start_time = Time(t)
+    elif isinstance(t, datetime):
+        start_time = Time(t)
+    else:
+        start_time = t
+
+    stop_time = start_time + timedelta(days=1)
 
     pos_ecliptic = get_position(target, observer, start_time, stop_time)
     pos_eq = ecliptic_to_equatorial(pos_ecliptic)
@@ -708,17 +716,21 @@ class RomanPointing:
     def __init__(self, observation_date=None, ephem_file=None):
         """
         Initialize spacecraft pointing system
-        
+
         Parameters:
         -----------
-        observation_date : datetime object or astropy Time object
+        observation_date : datetime object or astropy Time object or str
         ephem_file : str, optional
             Path to OEM ephemeris file. If None, uses the module-level default.
         """
         if observation_date is None:
             self.observation_date = Time.now()
         elif isinstance(observation_date, str):
-            self.observation_date = datetime.fromisoformat(observation_date)
+            # Convert string to Time object for consistent handling
+            self.observation_date = Time(observation_date)
+        elif isinstance(observation_date, datetime):
+            # Convert datetime to Time object
+            self.observation_date = Time(observation_date)
         else:
             self.observation_date = observation_date
 
@@ -751,9 +763,14 @@ class RomanPointing:
 
         self._update_sun_position()
 
-    def _update_observation_date(self,observation_date):
-
-        self.observation_date = observation_date
+    def _update_observation_date(self, observation_date):
+        # Convert to Time object for consistent handling
+        if isinstance(observation_date, str):
+            self.observation_date = Time(observation_date)
+        elif isinstance(observation_date, datetime):
+            self.observation_date = Time(observation_date)
+        else:
+            self.observation_date = observation_date
         self._update_sun_position()
     
 
