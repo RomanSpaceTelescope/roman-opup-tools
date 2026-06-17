@@ -8,7 +8,7 @@ Date: 2025-11-18
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
-from astropy.time import Time
+from astropy.time import Time, TimeDelta
 from astropy.coordinates import SkyCoord, get_sun, get_body_barycentric, solar_system_ephemeris
 from astropy import units as u
 import datetime
@@ -420,7 +420,7 @@ def get_sun_from_l2_jpl(t):
     else:
         start_time = t
 
-    stop_time = start_time + timedelta(days=1)
+    stop_time = start_time + TimeDelta(1, format='jd')
 
     pos_ecliptic = get_position(target, observer, start_time, stop_time)
     pos_eq = ecliptic_to_equatorial(pos_ecliptic)
