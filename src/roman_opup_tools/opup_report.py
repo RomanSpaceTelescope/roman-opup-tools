@@ -4325,18 +4325,14 @@ def add_attitude_columns(df):
     pitches = []
     rolls = []
 
-    try:
+    if Path(ephem).is_file():
         oem = _get_oem(ephem)
-        rp = RomanPointing(observation_date="2026-09-07 11:24:00",ephem_file=ephem)
-        _sun_source = 'OEM'
-    except (FileNotFoundError, OSError):
-        import warnings
-        warnings.warn(
-            f"OEM ephemeris file not found ({ephem}). "
-            f"Falling back to JPL Horizons for Sun position.",
-            stacklevel=2,
-        )
+        rp = RomanPointing(observation_date="2026-09-07 11:24:00", ephem_file=ephem)
+        _sun_source = 'OEM' if oem is not None else 'JPL'
+    else:
+        print(f"  ⚠️  OEM ephemeris file not found ({ephem.name}); using JPL Horizons fallback for Sun position.")
         oem = None
+        rp = RomanPointing(observation_date="2026-09-07 11:24:00", ephem_file=None)
         _sun_source = 'JPL'
 
 
