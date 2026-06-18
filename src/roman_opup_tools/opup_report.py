@@ -4336,7 +4336,14 @@ def add_attitude_columns(df):
         _sun_source = 'JPL'
 
 
-    for idx, row in df.iterrows():
+    n_rows = len(df)
+    if _sun_source == 'JPL':
+        print(f"  Querying JPL Horizons for Sun position ({n_rows} rows — this may take a while)...")
+
+    for i, (idx, row) in enumerate(df.iterrows()):
+        if _sun_source == 'JPL' and n_rows > 1:
+            print(f"  Row {i+1}/{n_rows}...", end='\r', flush=True)
+
         if any(pd.isna(row.get(c)) for c in required):
             sun_angles.append(None)
             pitches.append(None)
@@ -4379,6 +4386,9 @@ def add_attitude_columns(df):
         sun_angles.append(round(sun_angle, 2))
         pitches.append(round(pitch_val, 2))
         rolls.append(round(roll_val, 2))
+
+    if _sun_source == 'JPL' and n_rows > 1:
+        print()  # clear the \r progress line
 
     df['Sun_Angle [calc]'] = sun_angles
     df['Pitch [calc]'] = pitches

@@ -362,6 +362,22 @@ def generate_html(preloaded_datasets=None, sun_position=None):
     # Prepare JavaScript data strings
     preloaded_js, sun_js = _prepare_javascript_data(preloaded_datasets, sun_position, star_catalog_json)
 
+    # Build a plain-JS data block (outside Babel) to keep the Babel script under
+    # the 500KB deoptimisation threshold that breaks the in-browser JSX transpiler.
+    data_scripts = (
+        "<script>\n"
+        "        // Data injected at generation time — no JSX transpilation needed\n"
+        f"        {preloaded_js}\n"
+        f"        {sun_js}\n"
+        f"        const STAR_CATALOG = {star_catalog_json};\n"
+        "        // Register a Babel preset that uses the classic JSX transform\n"
+        "        // (avoids the importSource/runtime conflict in newer Babel standalone)\n"
+        "        Babel.registerPreset('react-classic', {\n"
+        "            presets: [[Babel.availablePresets['react'], { runtime: 'classic' }]]\n"
+        "        });\n"
+        "    </script>"
+    )
+
     html_content = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -378,31 +394,23 @@ def generate_html(preloaded_datasets=None, sun_position=None):
 </head>
 <body>
     <div id="root"></div>
-    
-    <script type="text/babel">
-        const { useState, useEffect } = React;
 
-        // ===== PRE-LOADED DATASETS (embedded at generation time) =====
-        __PRELOADED_PLACEHOLDER__
-        __SUN_PLACEHOLDER__
+    __DATA_SCRIPTS_PLACEHOLDER__
+
+    <script type="text/babel" data-presets="react-classic">
+        const { useState, useEffect } = React;
 
         function AstronomicalSkyPlotter() {
           const [datasets, setDatasets] = useState([]);
           const [plotKey, setPlotKey] = useState(0);
           const [coordSystem, setCoordSystem] = useState('equatorial'); // 'equatorial' or 'galactic'
-          const [showStars, setShowStars] = React.useState(true); // NEW: toggle for stars
+          const [showStars, setShowStars] = React.useState(true);
 
           // Color palette for different purposes
           const colorPalette = [
             '#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8',
             '#F7DC6F', '#BB8FCE', '#85C1E2', '#F8B739', '#52B788'
           ];
-
-          const STAR_CATALOG = """ 
-
-    html_content += star_catalog_json
-
-    html_content += r""";
 
           const getStarCatalog = () => {{
             return STAR_CATALOG;
@@ -1297,11 +1305,9 @@ def generate_html(preloaded_datasets=None, sun_position=None):
     </script>
 </body>
 </html>"""
-    # Replace the placeholder with actual preloaded data
-    html_content = html_content.replace('__PRELOADED_PLACEHOLDER__', preloaded_js)
-    html_content = html_content.replace('__SUN_PLACEHOLDER__', sun_js)
-
-
+    # Replace data placeholder with a plain <script> block (outside Babel) so the
+    # Babel-transpiled JSX block stays well under the 500KB deoptimisation limit.
+    html_content = html_content.replace('__DATA_SCRIPTS_PLACEHOLDER__', data_scripts)
 
     return html_content
 
