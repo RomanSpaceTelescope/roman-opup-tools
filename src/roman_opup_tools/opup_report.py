@@ -1286,7 +1286,7 @@ def process_odf_files(json_files):
     """
     outputs = []
     for json_file in json_files:
-        
+
         opup_filepath = Path(json_file).parent.as_posix()
         if tarfile.is_tarfile(opup_filepath):
             # If the json file is in a gzipped tarball, we need to extract the file object
@@ -1305,6 +1305,12 @@ def process_odf_files(json_files):
 
         # Convert each visit to a pandas Series and create a DataFrame
         dataf = pd.DataFrame([pd.Series(visit) for visit in visits])
+
+        # Standardize column names: rename lowercase 'start' and 'duration' to capitalized versions
+        if 'start' in dataf.columns:
+            dataf = dataf.rename(columns={'start': 'Start'})
+        if 'duration' in dataf.columns:
+            dataf = dataf.rename(columns={'duration': 'Duration'})
 
         # Add a column with the name of the parent directory (assumed to be 'opup')
         dataf['opup'] = os.path.basename(opup_filepath)
@@ -2488,16 +2494,55 @@ def _calculate_report_statistics(df):
 
     return stats
 
+def split_008_visits(df):
+    """
+    For Visit_IDs starting with '008', add a new column 'Visit_Group_008' that groups visits
+    by their RA/DEC position (rounding to 2 decimal places to account for small dithers).
+    This allows 008 visits pointing to the same field to be displayed together in the report.
+
+    Non-008 visits get Visit_Group_008 = '' (empty string).
+    """
+    if 'Visit_ID' not in df.columns:
+        return df
+
+    df = df.copy()
+    df['Visit_Group_008'] = ''
+
+    # Identify 008 visits
+    mask_008 = df['Visit_ID'].astype(str).str.startswith('008')
+
+    if not mask_008.any():
+        return df
+
+    # For 008 visits with RA/DEC, create a group key
+    if 'RA' in df.columns and 'DEC' in df.columns:
+        def make_radec_key(row):
+            if pd.isna(row['RA']) or pd.isna(row['DEC']):
+                return ''
+            ra_rounded = round(float(row['RA']), 2)
+            dec_rounded = round(float(row['DEC']), 2)
+            return f"{ra_rounded:.2f}_{dec_rounded:.2f}"
+
+        df.loc[mask_008, 'Visit_Group_008'] = df.loc[mask_008].apply(make_radec_key, axis=1)
+
+        # Log the grouping for user feedback
+        n_008 = mask_008.sum()
+        n_groups = df.loc[mask_008, 'Visit_Group_008'].nunique()
+        print(f"  📍 Grouped {n_008} visits starting with '008' into {n_groups} field(s) by pointing direction")
+
+    return df
+
 def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map=None, skyplot_mosaic_filename=None):
     """
     Generate HTML content with hyperlinks to visit files and horizontal scrolling.
     Includes embedded visit file contents with syntax highlighting.
-    
+    For Visit_IDs starting with '008', visits are grouped by pointing direction.
+
     Args:
         df: DataFrame containing OPUP data
         opup_filepath: Path to the OPUP archive for creating links
         sky_plotter_html: Optional path to sky plotter HTML file for cross-linking
-    
+
     Returns:
         HTML string
     """
@@ -2507,6 +2552,9 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
         visit_png_map = {}
     if skyplot_mosaic_filename is None:
         skyplot_mosaic_filename = ''
+
+    # Split 008 visits by pointing direction
+    df = split_008_visits(df)
 
     # Prepare visit file contents
     visit_contents_raw_json, visit_contents_highlighted_json, visit_contents = _prepare_visit_contents_for_report(df, opup_filepath)
@@ -3568,20 +3616,27 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
     if group_cols_present:
         # Build group key per row and identify groups
         df_temp = df.copy()
-        df_temp['_group_key'] = df_temp[GROUP_COLS].astype(str).agg('|'.join, axis=1)
-        
+
+        # For 008 visits, use Visit_Group_008 in addition to standard grouping
+        grouping_cols = GROUP_COLS.copy()
+        if 'Visit_Group_008' in df_temp.columns and df_temp['Visit_Group_008'].str.len().max() > 0:
+            # If we have 008 visit grouping, insert it early in the grouping hierarchy
+            grouping_cols = ['Visit_Group_008'] + grouping_cols
+
+        df_temp['_group_key'] = df_temp[grouping_cols].astype(str).agg('|'.join, axis=1)
+
         # Count rows per group
         group_sizes = df_temp.groupby('_group_key', sort=False).size()
-        
+
         # Track group transitions
         current_group = None
         group_counter = 0
         row_in_group = 0
-        
+
         for idx, row in df_temp.iterrows():
             gk = row['_group_key']
             n_rows = group_sizes[gk]
-            
+
             if gk != current_group:
                 # New group starts
                 current_group = gk
@@ -4573,7 +4628,9 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, gen
     step += 1
     print(f"\nStep {step}: Generating full CSV...")
     full_csv = output_dir / f"{opup_stem}_full.csv"
-    write_to_CSV(opup_info, full_csv, keep_GW=keep_GW)
+    # Remove temporary Visit_Group_008 column before writing CSV
+    opup_info_for_csv = opup_info.drop(columns=['Visit_Group_008'], errors='ignore')
+    write_to_CSV(opup_info_for_csv, full_csv, keep_GW=keep_GW)
     generated_files.append(full_csv)
 
     # ── Step 10: Package everything ──
