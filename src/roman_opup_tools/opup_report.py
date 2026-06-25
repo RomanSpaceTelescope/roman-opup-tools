@@ -3539,9 +3539,8 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
         html += "    </div>\n"
         
     # Determine if grouping is possible (needed for both buttons and row generation)
-    GROUP_COLS = ['Program_Number', 'Exec_Plan_Number', 'Pass_Number', 
-                  'Segment_Number', 'Observation_Number']
-    group_cols_present = all(col in df.columns for col in GROUP_COLS)
+    GROUP_COLS = ['Visit_ID']
+    group_cols_present = 'Visit_ID' in df.columns
         # Add expand/collapse controls above the table
     if group_cols_present:
         html += """
@@ -4329,7 +4328,7 @@ def get_pitch_and_roll(ra, dec, v3pa, obs_time):
 
     # 5. Roll = difference between actual V3PA and nominal V3PA
     #    Wrap to [-180, +180]
-    roll = (v3pa - nominal_v3pa.value + 180) % 360 - 180
+    roll = (nominal_v3pa.value - v3pa + 180) % 360 - 180
 
     return {
         'pitch': pitch.value,
@@ -4436,7 +4435,7 @@ def add_attitude_columns(df):
         rp._update_observation_date(observation_date=obs_time)
         rp.set_target_using_radec(ra, dec, roll=0.0)
         nominal_v3pa = rp.get_position_angle()
-        roll_val = (v3pa - nominal_v3pa.value + 180) % 360 - 180
+        roll_val = (nominal_v3pa.value - v3pa + 180) % 360 - 180
 
         sun_angles.append(round(sun_angle, 2))
         pitches.append(round(pitch_val, 2))
