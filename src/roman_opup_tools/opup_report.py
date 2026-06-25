@@ -1351,7 +1351,13 @@ def parse_OPUP(opup_filepath):
     obsplan_filepaths = get_odf_from_OPUP(opup_filepath)
     obsplan_df= export_obsplan_from_json(obsplan_filepaths)
 
-    # Merging the obsplan df with the opup df
+    # Merging the obsplan df with the opup df.
+    # If opup_info has no Visit_ID column (e.g. a CGI-only OPUP with no WFI
+    # exposures), skip the merge and return obsplan_df directly.
+    if 'Visit_ID' not in opup_info.columns:
+        print("  Note: No WFI exposure data found (CGI-only OPUP?). Returning ODF metadata only.")
+        return obsplan_df
+
     opup_info = pd.merge(obsplan_df, opup_info, on=['Visit_ID'])
 
     return opup_info
@@ -3425,13 +3431,12 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
         <h3>Instrument Breakdown</h3>
 """
         # Create aggregation dictionary
-        agg_dict = {
-            'Visit_ID': 'nunique',
-            'SCI_ID': 'count'
-        }
-        
-        instr_breakdown = df.groupby('Science_Instrument', as_index=False).agg(agg_dict)
-        instr_breakdown.columns = ['Instrument', 'Unique Visits', 'Total Exposures']
+        count_col = 'SCI_ID' if 'SCI_ID' in df.columns else 'Visit_ID'
+        instr_breakdown = df.groupby('Science_Instrument', as_index=False).agg(
+            **{'Unique Visits': ('Visit_ID', 'nunique'),
+               'Total Exposures': (count_col, 'count')}
+        )
+        instr_breakdown.insert(0, 'Instrument', instr_breakdown.pop('Science_Instrument'))
         
         # Add duration if available - only count once per visit
         if 'Duration' in df.columns and 'Visit_ID' in df.columns:
@@ -3482,13 +3487,12 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
         <h3>Filter Usage</h3>
 """
         # Create aggregation dictionary
-        agg_dict = {
-            'Visit_ID': 'nunique',
-            'SCI_ID': 'count'
-        }
-        
-        filter_breakdown = df.groupby('WFI_Optical_Element', as_index=False).agg(agg_dict)
-        filter_breakdown.columns = ['Filter', 'Unique Visits', 'Total Exposures']
+        count_col = 'SCI_ID' if 'SCI_ID' in df.columns else 'Visit_ID'
+        filter_breakdown = df.groupby('WFI_Optical_Element', as_index=False).agg(
+            **{'Unique Visits': ('Visit_ID', 'nunique'),
+               'Total Exposures': (count_col, 'count')}
+        )
+        filter_breakdown.insert(0, 'Filter', filter_breakdown.pop('WFI_Optical_Element'))
         
         # Add duration if available - only count once per visit
         if 'Duration' in df.columns and 'Visit_ID' in df.columns:
