@@ -87,6 +87,9 @@ opup-report --gantt aggregated_opups_20260428_143022.csv -odir ./charts/
 
 # Directory mode with CSV-only output
 opup-report -opup_dir /path/to/opup_folder/ --format csv
+
+# Omit visit file links and embedded content (much smaller HTML for large OPUPs)
+opup-report -opup my_opup.tgz --no-visit-links
 ```
 
 ### Command Line Arguments
@@ -102,6 +105,7 @@ opup-report -opup_dir /path/to/opup_folder/ --format csv
 | `--pngs` | | Generate sky plot PNGs via `roman_visit_viewer` (slower) | `False` |
 | `--gantt` | | Generate Gantt chart directly from an aggregated CSV file (skips OPUP parsing) | `None` |
 | `--format` | | Output format: `integrated`, `csv`, `html`, or `both` | `integrated` |
+| `--no-visit-links` | | Omit clickable visit file links and embedded visit content from the HTML report (significantly reduces file size for large OPUPs) | `False` |
 
 ### Output Formats
 
