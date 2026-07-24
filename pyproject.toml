@@ -16,6 +16,7 @@ dependencies = [
     "pandas>=2.1",
     "pysiaf>=0.22",
     "scipy>=1.11",
+    "tqdm>=4.60",
 ]
 
 [project.optional-dependencies]

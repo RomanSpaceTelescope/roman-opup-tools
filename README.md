@@ -26,7 +26,6 @@ The OPUP Report Generator extracts observation data from compressed OPUP archive
 - 📈 **Instrument breakdown**: Per-instrument statistics and duration calculations
 - 🌞 **Sun avoidance zones**: Automatic Sun position calculation for visit dates
 - 💾 **Flexible output**: Integrated (default), CSV, HTML, or both formats
-- 📸 **Optional PNG sky plots**: Generate static sky plot images via `roman_visit_viewer`
 
 ## 🚀 Installation
 
@@ -76,9 +75,6 @@ opup-report -opup my_opup.tgz --format both
 # Include Guide Window columns in CSV output
 opup-report -opup my_opup.tgz --keep_GW
 
-# Generate sky plot PNGs (slower) in addition to integrated report
-opup-report -opup my_opup.tgz --pngs
-
 # Process SCF and visit files alongside OPUPs (legacy mode)
 opup-report -opup my_opup.tgz -scf SCF_001.scf -visit V01001001001.vis --format csv
 
@@ -102,7 +98,6 @@ opup-report -opup my_opup.tgz --no-visit-links
 | `--visit_filepath` | `-visit` | Path(s) to visit file(s) (used in csv/html/both modes) | `[]` |
 | `--output_dir` | `-odir` | Output directory | Same as input |
 | `--keep_GW` | | Keep Guide Window columns in CSV output (default: separated to `_GWInfo.csv`) | `False` |
-| `--pngs` | | Generate sky plot PNGs via `roman_visit_viewer` (slower) | `False` |
 | `--gantt` | | Generate Gantt chart directly from an aggregated CSV file (skips OPUP parsing) | `None` |
 | `--format` | | Output format: `integrated`, `csv`, `html`, or `both` | `integrated` |
 | `--no-visit-links` | | Omit clickable visit file links and embedded visit content from the HTML report (significantly reduces file size for large OPUPs) | `False` |
@@ -233,7 +228,6 @@ Plus many more instrument-specific parameters extracted from visit files.
 ### Visualization
 
 - `generate_gantt_chart()` - Create Gantt chart from aggregated data
-- Sky plot generation via `roman_plotter.py` / `roman_visit_viewer`
 
 ## 🌐 Integration with Sky Plotter
 
@@ -246,8 +240,6 @@ When `roman_plotter.py` is available, the tool automatically:
    - Clickable visit markers
 4. Cross-links between data table and sky plot
 
-When `--pngs` is specified and `roman_visit_viewer` is available, static PNG sky plots are also generated.
-
 ## 🐛 Troubleshooting
 
 | Issue | Solution |
@@ -257,7 +249,6 @@ When `--pngs` is specified and `roman_visit_viewer` is available, static PNG sky
 | Sky plotter not generated | Ensure `roman_plotter.py` is in the same directory |
 | Visit file content not displaying | Verify OPUP archive structure and visit file paths |
 | Gantt chart not generated | Ensure aggregated CSV has required columns (Visit_ID, start/end times) |
-| `--pngs` not producing output | Ensure `roman_visit_viewer` is installed and accessible |
 
 ## 📝 Notes
 

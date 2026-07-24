@@ -18,3 +18,6 @@ src/roman_opup_tools.egg-info/top_level.txt
 src/roman_opup_tools/__pycache__/test_roman_attitude.cpython-312-pytest-9.0.2.pyc
 src/roman_opup_tools.egg-info/entry_points.txt
 *.pyc
+
+# Configuration file with environment-specific paths (ephemeris files, etc.)
+config.json

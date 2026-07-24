@@ -357,381 +357,8 @@ def add_pointing_columns(df):
 matplotlib.use('Agg')  # non-interactive backend for batch generation
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PART 2: SKY PLOT GENERATION
+# PART 2: VISIT FILE PARSING
 # ═════════════════════════════════════════════════════════════════════════════
-
-def generate_sky_plot_pngs(opup_filepath, output_dir, df):
-    """
-    For each unique visit in the DataFrame, extract the .vst file from the OPUP,
-    run roman_visit_viewer's plot_manager, and save a PNG.
-
-    Returns:
-        dict: mapping visit_filename (str) -> png_relative_path (str)
-    """
-    
-    matplotlib.use('Agg')
-
-    output_dir = Path(output_dir)
-    png_dir = output_dir / "sky_plots"
-    png_dir.mkdir(exist_ok=True)
-
-    if 'Visit_File_Name' not in df.columns:
-        print("Warning: No Visit_File_Name column; cannot generate sky plots.")
-        return {}
-
-    unique_vst = [v for v in df['Visit_File_Name'].dropna().unique() if str(v).endswith('.vst')]
-    if not unique_vst:
-        return {}
-
-    # ── Use the existing function to bulk-extract all .vst contents at once ──
-    visit_contents = get_all_visit_contents(opup_filepath, unique_vst)
-
-    visit_png_map = {}
-
-    for vst_name, vst_content in tqdm(visit_contents.items(), desc="  Sky plot PNGs", unit="visit"):
-        try:
-            # 1) Write the visit content to a temp file so VisitFileParser can open it
-            tmp_vst = png_dir / vst_name
-            with open(tmp_vst, 'w') as f:
-                f.write(vst_content)
-
-            # 2) Parse and plot
-            parser = VisitFileParser(str(tmp_vst))
-            plot_manager(parser, exp_num=1, output_dir=png_dir)
-
-            # 3) plot_manager saves to CWD as "<name>_all.png"
-            #    Move it into our sky_plots directory
-            vst_stem = vst_name.replace('.vst', '')
-            for png_file in png_dir.glob(f"{vst_stem}*.png"):
-                visit_png_map[vst_name] = str(png_file)
-                print(f"  🔭 Generated sky plot: {png_file}")
-                break
-
-            # Clean up temp .vst
-            tmp_vst.unlink(missing_ok=True)
-
-        except Exception as e:
-            print(f"  ⚠️  Could not generate sky plot for {vst_name}: {e}")
-            # Clean up on failure too
-            tmp_vst = png_dir / vst_name
-            if tmp_vst.exists():
-                tmp_vst.unlink(missing_ok=True)
-
-    return visit_png_map
-
-def generate_skyplot_mosaic_html(visit_png_map, opup_name, output_path, df=None):
-    """
-    Generate a standalone HTML mosaic page of all sky plot PNGs.
-    Each image gets an anchor ID so the main report can deep-link to it.
-
-    Args:
-        visit_png_map: dict mapping visit_filename -> relative png path
-        opup_name: str, OPUP name for the page title
-        output_path: Path or str, where to write the HTML
-        df: optional DataFrame to pull metadata (RA, Dec, filter) per visit
-
-    Returns:
-        Path to the generated HTML file, or None if no images
-    """
-    if not visit_png_map:
-        return None
-
-    output_path = Path(output_path)
-
-    # Build metadata lookup from DataFrame if available
-    visit_meta = {}
-    if df is not None and 'Visit_File_Name' in df.columns:
-        for vf in visit_png_map:
-            rows = df[df['Visit_File_Name'] == vf]
-            if len(rows) > 0:
-                row = rows.iloc[0]
-                meta = {}
-                for col in ['Visit_ID', 'RA', 'DEC', 'Position_Angle',
-                            'WFI_Optical_Element', 'Program_Number']:
-                    if col in rows.columns and pd.notna(row.get(col)):
-                        meta[col] = row[col]
-                visit_meta[vf] = meta
-
-    # Sort by visit filename for consistent ordering
-    sorted_visits = sorted(visit_png_map.keys())
-
-    n_visits = len(sorted_visits)
-
-    # ── Build the HTML ──
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sky Plots - {opup_name}</title>
-    <style>
-        * {{
-            box-sizing: border-box;
-        }}
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #1a1a2e;
-            color: #e0e0e0;
-        }}
-        h1 {{
-            color: #e0e0e0;
-            border-bottom: 3px solid #3498db;
-            padding-bottom: 10px;
-            margin-bottom: 5px;
-        }}
-        .subtitle {{
-            color: #95a5a6;
-            font-size: 14px;
-            margin-bottom: 20px;
-        }}
-        .back-link {{
-            display: inline-block;
-            margin-bottom: 15px;
-            color: #3498db;
-            text-decoration: none;
-            font-weight: 600;
-            font-size: 14px;
-        }}
-        .back-link:hover {{
-            color: #5dade2;
-            text-decoration: underline;
-        }}
-
-        /* ── Filter bar ── */
-        .filter-bar {{
-            background: #16213e;
-            padding: 12px 15px;
-            border-radius: 6px;
-            margin-bottom: 20px;
-            display: flex;
-            gap: 10px;
-            align-items: center;
-            flex-wrap: wrap;
-        }}
-        .filter-bar label {{
-            font-size: 13px;
-            color: #95a5a6;
-            font-weight: 600;
-        }}
-        .filter-bar input {{
-            padding: 6px 12px;
-            border: 1px solid #34495e;
-            border-radius: 4px;
-            background: #1a1a2e;
-            color: #e0e0e0;
-            font-size: 13px;
-            width: 220px;
-        }}
-        .filter-bar input::placeholder {{
-            color: #5a6a7a;
-        }}
-        .count-badge {{
-            background: #3498db;
-            color: white;
-            padding: 4px 10px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 600;
-            margin-left: auto;
-        }}
-
-        /* ── Mosaic grid ── */
-        .mosaic {{
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(520px, 1fr));
-            gap: 16px;
-        }}
-        .card {{
-            background: #16213e;
-            border-radius: 8px;
-            overflow: hidden;
-            border: 1px solid #2c3e6e;
-            transition: border-color 0.2s, box-shadow 0.2s;
-        }}
-        .card:hover {{
-            border-color: #3498db;
-            box-shadow: 0 4px 20px rgba(52, 152, 219, 0.3);
-        }}
-        .card.highlight {{
-            border-color: #f1c40f;
-            box-shadow: 0 4px 24px rgba(241, 196, 15, 0.4);
-        }}
-        .card-header {{
-            padding: 10px 14px;
-            background: #0f3460;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 6px;
-        }}
-        .card-title {{
-            font-weight: 700;
-            font-size: 13px;
-            color: #e0e0e0;
-            font-family: 'Consolas', 'Courier New', monospace;
-        }}
-        .card-meta {{
-            font-size: 11px;
-            color: #95a5a6;
-        }}
-        .card-meta span {{
-            margin-left: 10px;
-        }}
-        .card img {{
-            width: 100%;
-            height: auto;
-            display: block;
-            cursor: pointer;
-        }}
-
-        /* ── Lightbox ── */
-        .lightbox {{
-            display: none;
-            position: fixed;
-            z-index: 9999;
-            left: 0; top: 0;
-            width: 100%; height: 100%;
-            background: rgba(0, 0, 0, 0.92);
-            justify-content: center;
-            align-items: center;
-            cursor: zoom-out;
-        }}
-        .lightbox.active {{
-            display: flex;
-        }}
-        .lightbox img {{
-            max-width: 95%;
-            max-height: 95%;
-            border-radius: 6px;
-            box-shadow: 0 0 40px rgba(0,0,0,0.8);
-        }}
-        .lightbox-title {{
-            position: fixed;
-            top: 15px;
-            left: 50%;
-            transform: translateX(-50%);
-            color: white;
-            font-size: 14px;
-            font-weight: 600;
-            background: rgba(0,0,0,0.6);
-            padding: 6px 16px;
-            border-radius: 4px;
-        }}
-    </style>
-</head>
-<body>
-
-    <a href="{opup_name}_report.html" class="back-link">← Back to OPUP Report</a>
-    <h1>🔭 Visit Sky Plots</h1>
-    <p class="subtitle">{opup_name} &mdash; {n_visits} visits</p>
-
-    <div class="filter-bar">
-        <label for="searchBox">Filter:</label>
-        <input type="text" id="searchBox" placeholder="Type visit ID, filter, program..." oninput="filterCards()">
-        <span class="count-badge" id="countBadge">{n_visits} of {n_visits}</span>
-    </div>
-
-    <div class="mosaic" id="mosaic">
-"""
-
-    # ── One card per visit ──
-    for vst_name in sorted_visits:
-        png_path = visit_png_map[vst_name]
-        anchor_id = vst_name.replace('.vst', '')
-        meta = visit_meta.get(vst_name, {})
-
-        # Build metadata spans
-        meta_spans = ""
-        if 'Visit_ID' in meta:
-            meta_spans += f'<span>ID: {meta["Visit_ID"]}</span>'
-        if 'RA' in meta and 'DEC' in meta:
-            meta_spans += f'<span>RA: {float(meta["RA"]):.4f}°</span>'
-            meta_spans += f'<span>Dec: {float(meta["DEC"]):.4f}°</span>'
-        if 'Position_Angle' in meta:
-            meta_spans += f'<span>PA: {float(meta["Position_Angle"]):.2f}°</span>'
-        if 'WFI_Optical_Element' in meta:
-            meta_spans += f'<span>Filter: {meta["WFI_Optical_Element"]}</span>'
-        if 'Program_Number' in meta:
-            meta_spans += f'<span>Prog: {meta["Program_Number"]}</span>'
-
-        # Searchable text blob (hidden, used by JS filter)
-        search_blob = f'{vst_name} {anchor_id} ' + ' '.join(str(v) for v in meta.values())
-
-        html += f"""        <div class="card" id="{anchor_id}" data-search="{search_blob.lower()}">
-            <div class="card-header">
-                <span class="card-title">{vst_name}</span>
-                <span class="card-meta">{meta_spans}</span>
-            </div>
-            <img src="{png_path}" alt="Sky plot for {vst_name}" 
-                 onclick="openLightbox(this.src, '{vst_name}')" loading="lazy">
-        </div>
-"""
-
-    html += """    </div>
-
-    <!-- Lightbox overlay for full-size viewing -->
-    <div class="lightbox" id="lightbox" onclick="closeLightbox()">
-        <span class="lightbox-title" id="lightboxTitle"></span>
-        <img id="lightboxImg" src="" alt="Full size sky plot">
-    </div>
-
-    <script>
-        function filterCards() {
-            const query = document.getElementById('searchBox').value.toLowerCase();
-            const cards = document.querySelectorAll('.card');
-            let visible = 0;
-            cards.forEach(function(card) {
-                const text = card.getAttribute('data-search') || '';
-                if (text.includes(query)) {
-                    card.style.display = '';
-                    visible++;
-                } else {
-                    card.style.display = 'none';
-                }
-            });
-            document.getElementById('countBadge').textContent = visible + ' of ' + cards.length;
-        }
-
-        function openLightbox(src, title) {
-            document.getElementById('lightboxImg').src = src;
-            document.getElementById('lightboxTitle').textContent = title;
-            document.getElementById('lightbox').classList.add('active');
-        }
-
-        function closeLightbox() {
-            document.getElementById('lightbox').classList.remove('active');
-        }
-
-        document.addEventListener('keydown', function(e) {
-            if (e.key === 'Escape') closeLightbox();
-        });
-
-        // Highlight card if arrived via anchor
-        (function() {
-            var hash = window.location.hash.replace('#', '');
-            if (hash) {
-                var el = document.getElementById(hash);
-                if (el) {
-                    el.classList.add('highlight');
-                    setTimeout(function() { el.scrollIntoView({behavior: 'smooth', block: 'center'}); }, 100);
-                    setTimeout(function() { el.classList.remove('highlight'); }, 3000);
-                }
-            }
-        })();
-    </script>
-
-</body>
-</html>
-"""
-
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(html)
-
-    print(f"  🖼️  Generated sky plot mosaic: {output_path}")
-    return output_path
 
 def parse_visit_header(visit_header_line):
 
@@ -2557,7 +2184,7 @@ def split_008_visits(df):
 
     return df
 
-def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map=None, skyplot_mosaic_filename=None, include_visit_links=True):
+def generate_html_report(df, opup_filepath, sky_plotter_html=None, include_visit_links=True):
     """
     Generate HTML content with hyperlinks to visit files and horizontal scrolling.
     Includes embedded visit file contents with syntax highlighting.
@@ -2572,11 +2199,6 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
         HTML string
     """
     opup_name = Path(opup_filepath).name
-
-    if visit_png_map is None:
-        visit_png_map = {}
-    if skyplot_mosaic_filename is None:
-        skyplot_mosaic_filename = ''
 
     # Split 008 visits by pointing direction
     df = split_008_visits(df)
@@ -3299,14 +2921,6 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
         html += f"""        <p><strong>🌌 <a href="{sky_plotter_filename}" target="_blank" style="color: #3498db; text-decoration: none; font-weight: bold;">Sky Map →</a></strong></p>
 """
     
-    # DEBUG — remove after confirming
-    print(f"  DEBUG: skyplot_mosaic_filename = '{skyplot_mosaic_filename}'")
-
-        # Add sky plot mosaic link if available    
-    if skyplot_mosaic_filename:
-        html += f"""        <p><strong>🔭 <a href="{skyplot_mosaic_filename}" target="_blank" style="color: #3498db; text-decoration: none; font-weight: bold;">Visit Sky Plots →</a></strong></p>
-"""
-
     html += f"""    </div>
 
 
@@ -3745,22 +3359,12 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
             if not include_visit_links:
                 return html_module.escape(vf)
 
-            png_path = visit_png_map.get(vf, '')
-
             # Existing: click visit name to view STOL content
             link_html = (
                 f'<a href="#" class="visit-link" '
                 f'onclick="showVisitContent(\'{vf}\'); return false;" '
                 f'title="Click to view {vf}">{vf}</a>'
             )
-
-            if png_path and skyplot_mosaic_filename:
-                anchor = vf.replace('.vst', '')
-                link_html += (
-                    f' <a href="{skyplot_mosaic_filename}#{anchor}" '
-                    f'target="_blank" title="View sky plot" '
-                    f'style="text-decoration:none;">🔭</a>'
-                )
 
             return link_html
         else:
@@ -4241,7 +3845,7 @@ def syntax_highlight_visit_content(content):
     return '\n'.join(highlighted_lines)
 
 def write_to_HTML(df, output_html, opup_filepath, keep_GW=True,
-                  sky_plotter_html=None, visit_png_map=None, include_visit_links=True):
+                  sky_plotter_html=None, include_visit_links=True):
     """
     Write DataFrame to HTML file with optional GW column removal.
 
@@ -4252,9 +3856,6 @@ def write_to_HTML(df, output_html, opup_filepath, keep_GW=True,
         keep_GW: Whether to keep Guide Window columns
         include_visit_links: Whether to add clickable links on visit file names (default True).
     """
-
-    if visit_png_map is None:
-        visit_png_map = {}
 
     if not keep_GW:
         gw_cols = get_current_gw_columns(df)
@@ -4643,7 +4244,7 @@ def _parse_obs_time(start_str):
 
     return None
 
-def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, generate_pngs=False, include_visit_links=True):
+def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, include_visit_links=True):
     """
     Generate both the detailed OPUP HTML report and the sky plotter visualization.
 
@@ -4651,8 +4252,6 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, gen
         opup_filepath: Path to OPUP .tgz archive
         output_dir: Output directory (defaults to same as OPUP)
         keep_GW: Whether to keep Guide Window columns
-        generate_pngs: Whether to generate sky plot PNGs via roman_visit_viewer
-                       (default: False, uses Aladin Lite embedded viewer instead)
         include_visit_links: Whether to add clickable links on visit file names (default True).
                              Set to False to reduce HTML size for large OPUPs.
 
@@ -4719,43 +4318,13 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, gen
     if sky_plotter_html:
         generated_files.append(sky_plotter_html)
     
-    # ── Step 7: Sky plot PNGs (optional, off by default) ──
-    visit_png_map = {}
-    skyplot_mosaic_filename = ''
-    
-    if generate_pngs:
-        step += 1
-        print(f"\nStep {step}: Generating sky plot PNGs via roman_visit_viewer...")
-        try:
-            visit_png_map = generate_sky_plot_pngs(opup_filepath, output_dir, opup_info)
-            print(f"   Generated {len(visit_png_map)} sky plot PNGs")
-        except Exception as e:
-            print(f"   ⚠️  Sky plot generation failed: {e}")
-            visit_png_map = {}
-
-        # ── Step 7b: Sky plot mosaic HTML ──
-        if visit_png_map:
-            step += 1
-            print(f"\nStep {step}: Generating sky plot mosaic page...")
-            mosaic_path = output_dir / f"{opup_stem}_skyplots.html"
-            result = generate_skyplot_mosaic_html(
-                visit_png_map, opup_stem, mosaic_path, df=opup_info
-            )
-            if result:
-                skyplot_mosaic_filename = mosaic_path.name
-                generated_files.append(mosaic_path)
-    else:
-        print("\n  ⏭️  Skipping sky plot PNGs (using embedded Aladin Lite viewer)")
-
-    # ── Step 8: Main HTML report ──
+    # ── Step 7: Main HTML report ──
     step += 1
     print(f"\nStep {step}: Generating detailed HTML report...")
     html_report = output_dir / f"{opup_stem}_report.html"
     opup_info_for_html = opup_info if keep_GW else opup_info.drop(columns=get_current_gw_columns(opup_info), errors='ignore')
     html_content = generate_html_report(
         opup_info_for_html, opup_filepath, sky_plotter_html,
-        visit_png_map=visit_png_map,
-        skyplot_mosaic_filename=skyplot_mosaic_filename,
         include_visit_links=include_visit_links,
     )
 
@@ -4790,8 +4359,6 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, gen
     print(f"\n📄 Detailed Report: {html_report}")
     if sky_plotter_html:
         print(f"🌌 Sky Plotter:     {sky_plotter_html}")
-    if skyplot_mosaic_filename:
-        print(f"🔭 Sky Plot Mosaic: {output_dir / skyplot_mosaic_filename}")
     print(f"📊 Full CSV:        {full_csv}")
     print(f"📊 Sky Plot CSV:    {plotter_csv}")
     if archive_path:
@@ -5523,8 +5090,7 @@ def package_report_archive(opup_stem, output_dir, generated_files=None):
     for easy sharing and portability.
 
     The archive preserves relative paths so that HTML cross-links
-    (to sky_plots/, mosaic page, sky plotter, etc.) still work
-    when extracted into a single folder.
+    (sky plotter, etc.) still work when extracted into a single folder.
 
     Args:
         opup_stem: str, the OPUP name stem (e.g. 'my_opup')
@@ -5551,12 +5117,6 @@ def package_report_archive(opup_stem, output_dir, generated_files=None):
         for fpath in sorted(output_dir.glob(f"{opup_stem}*")):
             if fpath.is_file() and fpath.name != archive_name.name:
                 files_to_include.append(fpath)
-
-    # Also include sky_plots/ PNGs directory if it exists
-    sky_plots_dir = output_dir / "sky_plots"
-    if sky_plots_dir.is_dir():
-        for png_file in sorted(sky_plots_dir.glob("*.png")):
-            files_to_include.append(png_file)
 
     if not files_to_include:
         print("  ⚠️  No report files found to package.")
@@ -5615,9 +5175,6 @@ def setup_parser():
               # Include Guide Window columns in CSV output
               opup_report -opup my_opup.tgz --keep_GW
 
-              # Generate sky plot PNGs (slower) in addition to integrated report
-              opup_report -opup my_opup.tgz --pngs
-
               # Process SCF and visit files alongside OPUPs (legacy mode)
               opup_report -opup my_opup.tgz -scf SCF_001.scf -visit V01001001001.vis --format csv
 
@@ -5643,8 +5200,6 @@ def setup_parser():
                         help='Output directory (default: same directory as input file)', default=None)
     parser.add_argument('--keep_GW', action='store_true',
                         help='Keep Guide Window columns in CSV output (default: separated to _GWInfo.csv)')
-    parser.add_argument('--pngs', action='store_true', default=False,
-                        help='Generate sky plot PNGs via roman_visit_viewer (slower, off by default)')
     parser.add_argument('--gantt', type=str,
                         help='Generate Gantt chart directly from an aggregated CSV file (skips OPUP parsing)')
     parser.add_argument('--format', type=str, choices=['csv', 'html', 'both', 'integrated'],
@@ -5685,7 +5240,7 @@ def main():
     if output_format == 'integrated':
         # Generate integrated report with sky plotter
         for opup_filepath in opup_filepaths:
-            generate_integrated_report(opup_filepath, output_dir, keep_GW, generate_pngs=args.pngs, include_visit_links=include_visit_links)
+            generate_integrated_report(opup_filepath, output_dir, keep_GW, include_visit_links=include_visit_links)
         
         # If in directory mode, also generate aggregated output
         if directory_mode and len(opup_filepaths) > 1:
