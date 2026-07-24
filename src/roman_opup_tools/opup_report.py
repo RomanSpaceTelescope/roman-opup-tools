@@ -37,7 +37,20 @@ from pathlib import Path
 # This resolves to the directory containing opup_report.py, no matter
 # where you call `opup-report` from (home dir, /tmp, anywhere)
 _THIS_DIR = Path(__file__).resolve().parent.parent.parent
-ephem = _THIS_DIR / "RST_EPH_PRED_LONG_2026250_2027065_01.oem"
+_CONFIG_PATH = _THIS_DIR / "config.json"
+
+def _load_config():
+    """Load configuration from config.json at the repo root, with fallback to defaults."""
+    try:
+        with open(_CONFIG_PATH, 'r') as f:
+            config = json.load(f)
+            return config
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+_config = _load_config()
+_ephem_filename = _config.get('ephemeris', {}).get('filename', "RST_EPH_PRED_LONG_2026250_2027065_01.oem")
+ephem = _THIS_DIR / _ephem_filename
 
 
 # Columns to make first in the output CSV file (if available)

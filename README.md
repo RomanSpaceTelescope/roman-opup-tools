@@ -29,11 +29,26 @@ The OPUP Report Generator extracts observation data from compressed OPUP archive
 - 📸 **Optional PNG sky plots**: Generate static sky plot images via `roman_visit_viewer`
 
 ## 🚀 Installation
-Navigate to the root of the repo and type:
 
-```bash
-pip install -e .
-```
+### Prerequisites
+
+1. Navigate to the root of the repo and install the package:
+   ```bash
+   pip install -e .
+   ```
+
+2. **Configure the ephemeris file**: The tool requires an OEM ephemeris file for accurate Sun position calculations. Create or update `config.json` in the repo root:
+   ```json
+   {
+     "ephemeris": {
+       "filename": "/path/to/ephem_file.oem",
+       "description": "Ephemeris file for Roman mission observations"
+     }
+   }
+   ```
+   - The `filename` can be an absolute path or relative to the repo root
+   - If `config.json` is missing, the tool falls back to looking for `RST_EPH_PRED_LONG_2026250_2027065_01.oem` in the repo root
+   - **Tip:** Add your custom `config.json` to `.gitignore` if the ephemeris file path contains environment-specific data
 
 ## 📖 Usage
 
@@ -233,6 +248,7 @@ When `--pngs` is specified and `roman_visit_viewer` is available, static PNG sky
 
 | Issue | Solution |
 |-------|----------|
+| OEM ephemeris file not found warning | Create or update `config.json` in the repo root with the correct ephemeris file path (see Installation section) |
 | No columns returned for visit file | Check that visit file contains valid STOL syntax with exposure commands |
 | Sky plotter not generated | Ensure `roman_plotter.py` is in the same directory |
 | Visit file content not displaying | Verify OPUP archive structure and visit file paths |
