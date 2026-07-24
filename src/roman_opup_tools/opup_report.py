@@ -64,9 +64,108 @@ PRIORITY_COLUMNS = ['Visit_ID', 'SCI_ID', 'Visit_File_Name', 'RA_V1 [calc]', 'DE
 
 import numpy as np
 import json
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Column names for the ECI→BCS quaternion in the OPUP table
 QUAT_COLS = ['TAR_Q1_ECI2BCS', 'TAR_Q2_ECI2BCS', 'TAR_Q3_ECI2BCS', 'TAR_Q4_ECI2BCS']
+
+
+def _compute_one_footprint(row_dict, have_quat, key_cols):
+    """
+    Worker function for parallel footprint computation.
+    Re-imports pysiaf per process (each worker needs its own SIAF instance).
+    Returns (row_key, footprint_dict) or (row_key, None) on failure.
+    """
+    import pysiaf
+    import astropy.units as u
+    from roman_opup_tools import roman_attitude as _ra
+    RSIAF = pysiaf.Siaf('Roman')
+
+    row_key = '_'.join(str(row_dict[c]) for c in key_cols)
+    try:
+        if have_quat:
+            q1 = float(row_dict['TAR_Q1_ECI2BCS'])
+            q2 = float(row_dict['TAR_Q2_ECI2BCS'])
+            q3 = float(row_dict['TAR_Q3_ECI2BCS'])
+            q4 = float(row_dict['TAR_Q4_ECI2BCS'])
+            ra_v1, dec_v1, v3pa = _ra.quat_to_radec_pa(q1, q2, q3, q4)
+        else:
+            ra_v1  = float(row_dict['RA'])
+            dec_v1 = float(row_dict['DEC'])
+            v3pa   = float(row_dict['Position_Angle'])
+
+        att_mat = pysiaf.rotations.attitude_matrix(0, 0, ra_v1, dec_v1, v3pa)
+
+        wfi_cen = RSIAF['WFI_CEN']
+        wfi_cen.set_attitude_matrix(att_mat)
+        ra_wfi, dec_wfi = pysiaf.rotations.tel_to_sky(att_mat, wfi_cen.V2Ref, wfi_cen.V3Ref)
+        ra_cen  = float(ra_wfi.to(u.deg).value) if hasattr(ra_wfi, 'to') else float(ra_wfi)
+        dec_cen = float(dec_wfi.to(u.deg).value) if hasattr(dec_wfi, 'to') else float(dec_wfi)
+
+        visit_fp = {
+            'ra':      round(ra_v1, 7),
+            'dec':     round(dec_v1, 7),
+            'pa':      round(v3pa, 4),
+            'ra_cen':  round(ra_cen, 7),
+            'dec_cen': round(dec_cen, 7),
+            'scas':    {}
+        }
+
+        for isca in range(1, 19):
+            sca_name = f'WFI{isca:02d}_FULL'
+            aper = RSIAF[sca_name]
+            aper.set_attitude_matrix(att_mat)
+            ra_corners, dec_corners = [], []
+            for iv in range(1, 5):
+                ra_sky, dec_sky = aper.idl_to_sky(getattr(aper, f'XIdlVert{iv}'), getattr(aper, f'YIdlVert{iv}'))
+                ra_corners.append(float(ra_sky))
+                dec_corners.append(float(dec_sky))
+            ra_corners.append(ra_corners[0])
+            dec_corners.append(dec_corners[0])
+            visit_fp['scas'][sca_name] = [[round(r, 7), round(d, 7)] for r, d in zip(ra_corners, dec_corners)]
+
+        try:
+            cgi_aper = RSIAF['CGI_CEN']
+            cgi_aper.set_attitude_matrix(att_mat)
+            ra_corners, dec_corners = [], []
+            for iv in range(1, 5):
+                ra_sky, dec_sky = cgi_aper.idl_to_sky(getattr(cgi_aper, f'XIdlVert{iv}'), getattr(cgi_aper, f'YIdlVert{iv}'))
+                ra_corners.append(float(ra_sky))
+                dec_corners.append(float(dec_sky))
+            ra_corners.append(ra_corners[0])
+            dec_corners.append(dec_corners[0])
+            visit_fp['cgi'] = [[round(r, 7), round(d, 7)] for r, d in zip(ra_corners, dec_corners)]
+        except Exception:
+            pass
+
+        guide_stars = []
+        for isca in range(1, 19):
+            use_col = f'TRK_USE_GW{isca:02d}'
+            h_col   = f'TRK_H_GW{isca:02d}'
+            v_col   = f'TRK_V_GW{isca:02d}'
+            if not all(c in row_dict for c in [use_col, h_col, v_col]):
+                continue
+            mode_val = str(row_dict.get(use_col, '')).strip().strip('"')
+            if not mode_val or mode_val == 'nan':
+                continue
+            try:
+                fgs_x = float(row_dict[h_col])
+                fgs_y = float(row_dict[v_col])
+            except (ValueError, TypeError):
+                continue
+            sca_name = f'WFI{isca:02d}_FULL'
+            aper = RSIAF[sca_name]
+            aper.set_attitude_matrix(att_mat)
+            gs_ra, gs_dec = aper.sci_to_sky(fgs_x + 2048, 2048 - fgs_y)
+            guide_stars.append({'sca': isca, 'ra': round(float(gs_ra), 7), 'dec': round(float(gs_dec), 7), 'mode': mode_val})
+
+        visit_fp['guide_stars'] = guide_stars
+        return row_key, visit_fp
+
+    except Exception as e:
+        return row_key, None
+
 
 def precompute_wfi_footprints(df):
     """
@@ -134,139 +233,38 @@ def precompute_wfi_footprints(df):
     needed_cols = list(dict.fromkeys(needed_cols))
     unique_rows = df.drop_duplicates(subset=key_cols)[needed_cols].dropna(subset=pointing_cols)
 
-    print(f"  🔭 Computing WFI footprints for {len(unique_rows)} unique exposures...")
-
     footprints = {}
+    n = len(unique_rows)
+    rows_as_dicts = [row.to_dict() for _, row in unique_rows.iterrows()]
 
-    for _, row in unique_rows.iterrows():
-        # Build unique key string
-        row_key = '_'.join(str(row[c]) for c in key_cols)
+    PARALLEL_THRESHOLD = 100
 
-        try:
-            # ── Derive RA, Dec, V3PA ──
-            if have_quat:
-                q1 = float(row['TAR_Q1_ECI2BCS'])
-                q2 = float(row['TAR_Q2_ECI2BCS'])
-                q3 = float(row['TAR_Q3_ECI2BCS'])
-                q4 = float(row['TAR_Q4_ECI2BCS'])
-                ra_v1, dec_v1, v3pa = roman_attitude.quat_to_radec_pa(q1, q2, q3, q4)
+    if n > PARALLEL_THRESHOLD:
+        n_workers = min(os.cpu_count() or 4, n)
+        print(f"  ⚡ Parallelising over {n_workers} workers ({n} exposures)...")
+        futures = {}
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            for row_dict in rows_as_dicts:
+                fut = executor.submit(_compute_one_footprint, row_dict, have_quat, key_cols)
+                futures[fut] = '_'.join(str(row_dict[c]) for c in key_cols)
+
+            with tqdm(total=n, desc="  WFI footprints", unit="exp") as pbar:
+                for fut in as_completed(futures):
+                    row_key, fp = fut.result()
+                    if fp is not None:
+                        footprints[row_key] = fp
+                    else:
+                        print(f"    ⚠️  Footprint failed for {futures[fut]}")
+                    pbar.update(1)
+    else:
+        for row_dict in tqdm(rows_as_dicts, desc="  WFI footprints", unit="exp"):
+            row_key, fp = _compute_one_footprint(row_dict, have_quat, key_cols)
+            if fp is not None:
+                footprints[row_key] = fp
             else:
-                ra_v1  = float(row['RA'])
-                dec_v1 = float(row['DEC'])
-                v3pa   = float(row['Position_Angle'])
+                print(f"    ⚠️  Footprint failed for {row_key}")
 
-            # ── Build attitude matrix  (same as Exposure.plot()) ──
-            att_mat = pysiaf.rotations.attitude_matrix(0, 0, ra_v1, dec_v1, v3pa)
-
-            # ── WFI_CEN sky position (Aladin centering target) ──
-            wfi_cen = RSIAF['WFI_CEN']
-            wfi_cen.set_attitude_matrix(att_mat)
-            ra_wfi, dec_wfi = pysiaf.rotations.tel_to_sky(
-                att_mat, wfi_cen.V2Ref, wfi_cen.V3Ref
-            )
-            ra_cen  = float(ra_wfi.to(u.deg).value) if hasattr(ra_wfi, 'to') else float(ra_wfi)
-            dec_cen = float(dec_wfi.to(u.deg).value) if hasattr(dec_wfi, 'to') else float(dec_wfi)
-
-            visit_fp = {
-                'ra':      round(ra_v1, 7),
-                'dec':     round(dec_v1, 7),
-                'pa':      round(v3pa, 4),
-                'ra_cen':  round(ra_cen, 7),
-                'dec_cen': round(dec_cen, 7),
-                'scas':    {}
-            }
-
-            # ── Extract corners for each of the 18 SCAs ──
-            for isca in range(1, 19):
-                sca_name = f'WFI{isca:02d}_FULL'
-                aper = RSIAF[sca_name]
-                aper.set_attitude_matrix(att_mat)
-
-                ra_corners = []
-                dec_corners = []
-                for iv in range(1, 5):
-                    x_idl = getattr(aper, f'XIdlVert{iv}')
-                    y_idl = getattr(aper, f'YIdlVert{iv}')
-                    ra_sky, dec_sky = aper.idl_to_sky(x_idl, y_idl)
-                    ra_corners.append(float(ra_sky))
-                    dec_corners.append(float(dec_sky))
-
-                # Close the polygon
-                ra_corners.append(ra_corners[0])
-                dec_corners.append(dec_corners[0])
-
-                visit_fp['scas'][sca_name] = [
-                    [round(r, 7), round(d, 7)]
-                    for r, d in zip(ra_corners, dec_corners)
-                ]
-            # ── Extract CGI aperture corners ──
-            try:
-                cgi_aper = RSIAF['CGI_CEN']
-                cgi_aper.set_attitude_matrix(att_mat)
-                ra_corners = []
-                dec_corners = []
-                for iv in range(1, 5):
-                    x_idl = getattr(cgi_aper, f'XIdlVert{iv}')
-                    y_idl = getattr(cgi_aper, f'YIdlVert{iv}')
-                    ra_sky, dec_sky = cgi_aper.idl_to_sky(x_idl, y_idl)
-                    ra_corners.append(float(ra_sky))
-                    dec_corners.append(float(dec_sky))
-                ra_corners.append(ra_corners[0])
-                dec_corners.append(dec_corners[0])
-                visit_fp['cgi'] = [
-                    [round(r, 7), round(d, 7)]
-                    for r, d in zip(ra_corners, dec_corners)
-                ]
-            except Exception:
-                pass  # CGI aperture not available in this SIAF version
-            # ── 6. Extract guide window positions ──
-            # Columns: TRK_USE_GWxx ("GUIDE" or "SKY_FIXED")
-            #          TRK_H_GWxx, TRK_V_GWxx (FGS frame coords)
-            guide_stars = []
-            for isca in range(1, 19):
-                use_col = f'TRK_USE_GW{isca:02d}'
-                h_col   = f'TRK_H_GW{isca:02d}'
-                v_col   = f'TRK_V_GW{isca:02d}'
-
-                if not all(c in row.index for c in [use_col, h_col, v_col]):
-                    continue
-
-                mode_val = str(row.get(use_col, '')).strip().strip('"')
-                if not mode_val or mode_val == 'nan':
-                    continue
-
-                try:
-                    fgs_x = float(row[h_col])
-                    fgs_y = float(row[v_col])
-                except (ValueError, TypeError):
-                    continue
-
-                # Convert FGS frame → science frame → sky
-                # (same as roman_visit_viewer.py Exposure.plot())
-                scix = fgs_x + 2048
-                sciy = 2048 - fgs_y
-
-                sca_name = f'WFI{isca:02d}_FULL'
-                aper = RSIAF[sca_name]
-                aper.set_attitude_matrix(att_mat)
-                gs_ra, gs_dec = aper.sci_to_sky(scix, sciy)
-
-                guide_stars.append({
-                    'sca': isca,
-                    'ra': round(float(gs_ra), 7),
-                    'dec': round(float(gs_dec), 7),
-                    'mode': mode_val   # "GUIDE" or "SKY_FIXED"
-                })
-
-            visit_fp['guide_stars'] = guide_stars
-
-            footprints[row_key] = visit_fp
-
-        except Exception as e:
-            print(f"    ⚠️  Footprint failed for {row_key}: {e}")
-            continue
-
-    print(f"  ✅ Computed footprints for {len(footprints)}/{len(unique_rows)} exposures")
+    print(f"  ✅ Computed footprints for {len(footprints)}/{n} exposures")
     return footprints
 
 def add_pointing_columns(df):
@@ -302,7 +300,7 @@ def add_pointing_columns(df):
     dec_wfi_list = []
     v3pa_wfi_list = []
 
-    for _, row in df.iterrows():
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="  Pointing columns", unit="row"):
         try:
             q1 = float(row['TAR_Q1_ECI2BCS'])
             q2 = float(row['TAR_Q2_ECI2BCS'])
@@ -390,7 +388,7 @@ def generate_sky_plot_pngs(opup_filepath, output_dir, df):
 
     visit_png_map = {}
 
-    for vst_name, vst_content in visit_contents.items():
+    for vst_name, vst_content in tqdm(visit_contents.items(), desc="  Sky plot PNGs", unit="visit"):
         try:
             # 1) Write the visit content to a temp file so VisitFileParser can open it
             tmp_vst = png_dir / vst_name
@@ -1348,21 +1346,47 @@ def export_obsplan_from_json(json_files):
     output = pd.concat(outputs, ignore_index=True)
     return output
 
-def parse_OPUP(opup_filepath):
+def _parse_visit_content(args):
+    """Module-level worker: parse a visit file from its in-memory content string."""
+    filename, content = args
+    try:
+        file_obj = io.StringIO(content)
+        visit = parse_visit_file_obj(file_obj)
+        return extract_exposure_metadata(visit)
+    except Exception as e:
+        print(f'  ⚠️  Error parsing {filename}: {e}')
+        return pd.DataFrame()
 
+
+def parse_OPUP(opup_filepath):
     # Getting a list of all visit file paths in the opup
     scf_files = get_SCF_from_OPUP(opup_filepath)
 
-    # Parsing each SCF
-    opup_info = pd.DataFrame()
+    # Collect all visit filenames from all SCFs (one tarball pass each)
+    all_visit_files = []
     for scf_filepath in scf_files:
-        scf_info = parse_SCF(scf_filepath)
+        all_visit_files.extend(get_visits_from_SCF(scf_filepath))
 
-        opup_info = pd.concat((opup_info, scf_info))
+    visit_filenames = [Path(vf).name for vf in all_visit_files]
+
+    # Bulk-extract all visit contents in a single pass through the archive
+    visit_contents = get_all_visit_contents(opup_filepath, visit_filenames)
+
+    # Parse all visit files in parallel (CPU-bound, use processes)
+    items = [(fn, content) for fn, content in visit_contents.items()
+             if content != "Visit file not found in archive"]
+
+    dfs = []
+    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        for df_result in tqdm(executor.map(_parse_visit_content, items), total=len(items), desc="  Parsing visit files", unit="visit"):
+            if df_result is not None and not df_result.empty:
+                dfs.append(df_result)
+
+    opup_info = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
     # Parsing the obsplan json
     obsplan_filepaths = get_odf_from_OPUP(opup_filepath)
-    obsplan_df= export_obsplan_from_json(obsplan_filepaths)
+    obsplan_df = export_obsplan_from_json(obsplan_filepaths)
 
     # Merging the obsplan df with the opup df.
     # If opup_info has no Visit_ID column (e.g. a CGI-only OPUP with no WFI
@@ -1374,27 +1398,19 @@ def parse_OPUP(opup_filepath):
     opup_info = pd.merge(obsplan_df, opup_info, on=['Visit_ID'])
 
     return opup_info
+
+
 #%%
 def parse_SCF(scf_filepath):
     try:
-        
-        # Get list of visit file paths from the given SCF
         visit_files = get_visits_from_SCF(scf_filepath)
-
-        # Parsing each visit file and adding to a pandas df
         scf_info = pd.DataFrame()
         for visit_file in visit_files:
-
-            # Parsing visit file
             visit_df = parse_visit_file(visit_file)
-
-            # Concatenating df to opup info df
             scf_info = pd.concat((scf_info, visit_df))
-        
     except Exception as e:
         print(f'Encountered error while processing {scf_filepath}: {e}')
         scf_info = pd.DataFrame()
-
     return scf_info
 
 
@@ -1579,15 +1595,17 @@ def process_visits(visit_filepaths, output_dir=None, keep_GW=True):
 
 #%%
 
-def export_opup_to_html(opup_filepath, output_html_path=None, keep_GW=True):
+def export_opup_to_html(opup_filepath, output_html_path=None, keep_GW=True, include_visit_links=True):
     """
     Export OPUP data to an HTML file with hyperlinks to individual visit files.
-    
+
     Args:
         opup_filepath: Path to the OPUP .tgz archive
         output_html_path: Path for output HTML file (optional)
         keep_GW: Whether to keep Guide Window columns
-    
+        include_visit_links: Whether to add clickable links on visit file names (default True).
+                             Set to False to reduce HTML size for large OPUPs.
+
     Returns:
         Path to generated HTML file
     """
@@ -1610,7 +1628,7 @@ def export_opup_to_html(opup_filepath, output_html_path=None, keep_GW=True):
         output_html_path = Path(output_dir) / f"{Path(opup_filepath).stem}_report.html"
     
     # Generate HTML
-    html_content = generate_html_report(opup_info, opup_filepath)
+    html_content = generate_html_report(opup_info, opup_filepath, include_visit_links=include_visit_links)
     
     # Write HTML file
     with open(output_html_path, 'w', encoding='utf-8') as f:
@@ -1638,36 +1656,24 @@ def get_all_visit_contents(opup_filepath, visit_filenames):
             with tarfile.open(opup_filepath, 'r:gz') as opup_tar:
                 # Find all SCF tarballs in the OPUP
                 scf_members = [m for m in opup_tar.getmembers() if 'SCF' in m.name and m.name.endswith('.tgz')]
-                
-                print(f"Found {len(scf_members)} SCF tarball(s) in OPUP")
-                
-                # Process each SCF tarball
-                for scf_member in scf_members:
-                    print(f"  Processing {scf_member.name}...")
-                    
-                    # Extract the SCF tarball file object
+                visit_filenames_set = set(visit_filenames)
+                for scf_member in tqdm(scf_members, desc="  Extracting visit files", unit="scf"):
                     scf_file_obj = opup_tar.extractfile(scf_member)
-                    
                     if scf_file_obj:
-                        # Open the nested SCF tarball
                         with tarfile.open(fileobj=scf_file_obj, mode='r:gz') as scf_tar:
-                            # Look for visit files in this SCF
                             for member in scf_tar.getmembers():
                                 filename = Path(member.name).name
-                                
-                                if filename in visit_filenames and filename not in visit_contents:
-                                    # Extract the visit file content
+                                if filename in visit_filenames_set and filename not in visit_contents:
                                     visit_file_obj = scf_tar.extractfile(member)
                                     if visit_file_obj:
-                                        content = visit_file_obj.read().decode('utf-8', errors='replace')
-                                        visit_contents[filename] = content
-                                        print(f"    Extracted {filename} ({len(content)} chars)")
+                                        visit_contents[filename] = visit_file_obj.read().decode('utf-8', errors='replace')
                 
                 # Mark any missing files
-                for visit_filename in visit_filenames:
-                    if visit_filename not in visit_contents:
-                        visit_contents[visit_filename] = "Visit file not found in archive"
-                        print(f"  Warning: {visit_filename} not found")
+                missing = [fn for fn in visit_filenames if fn not in visit_contents]
+                if missing:
+                    print(f"  ⚠️  {len(missing)} visit file(s) not found in archive")
+                for fn in missing:
+                    visit_contents[fn] = "Visit file not found in archive"
                         
     except Exception as e:
         print(f"Error reading archive {opup_filepath}: {e}")
@@ -2551,7 +2557,7 @@ def split_008_visits(df):
 
     return df
 
-def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map=None, skyplot_mosaic_filename=None):
+def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map=None, skyplot_mosaic_filename=None, include_visit_links=True):
     """
     Generate HTML content with hyperlinks to visit files and horizontal scrolling.
     Includes embedded visit file contents with syntax highlighting.
@@ -2575,8 +2581,11 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
     # Split 008 visits by pointing direction
     df = split_008_visits(df)
 
-    # Prepare visit file contents
-    visit_contents_raw_json, visit_contents_highlighted_json, visit_contents = _prepare_visit_contents_for_report(df, opup_filepath)
+    # Prepare visit file contents (skipped when include_visit_links=False to keep HTML small)
+    if include_visit_links:
+        visit_contents_raw_json, visit_contents_highlighted_json, visit_contents = _prepare_visit_contents_for_report(df, opup_filepath)
+    else:
+        visit_contents_raw_json, visit_contents_highlighted_json, visit_contents = '{}', '{}', {}
 
     # Calculate statistics
     stats = _calculate_report_statistics(df)
@@ -2756,6 +2765,55 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
         .breakdown-value {{
             color: #7f8c8d;
             font-weight: bold;
+        }}
+
+        /* Program timeline */
+        .timeline-container {{
+            padding: 8px 0 4px;
+        }}
+        .timeline-axis {{
+            position: relative;
+            height: 20px;
+            margin-bottom: 6px;
+            margin-left: 110px;
+        }}
+        .timeline-tick-label {{
+            position: absolute;
+            font-size: 11px;
+            color: #7f8c8d;
+            white-space: nowrap;
+        }}
+        .timeline-row {{
+            display: flex;
+            align-items: center;
+            margin-bottom: 5px;
+        }}
+        .timeline-label {{
+            width: 110px;
+            min-width: 110px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #34495e;
+            padding-right: 8px;
+            text-align: right;
+        }}
+        .timeline-bar-track {{
+            flex: 1;
+            position: relative;
+            height: 18px;
+            background: #ecf0f1;
+            border-radius: 3px;
+        }}
+        .timeline-bar {{
+            position: absolute;
+            height: 100%;
+            border-radius: 3px;
+            opacity: 0.85;
+            cursor: default;
+        }}
+        .timeline-bar:hover {{
+            opacity: 1;
+            box-shadow: 0 0 0 2px rgba(0,0,0,0.2);
         }}
 
         /* Program hierarchy styling */
@@ -3311,19 +3369,28 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
             if 'Duration' in unique_visits_df.columns:
                 unique_visits_df_copy = unique_visits_df.copy()
                 unique_visits_df_copy['Duration'] = pd.to_numeric(unique_visits_df_copy['Duration'], errors='coerce')
-                
-                prog_breakdown = unique_visits_df_copy.groupby('Program_Number').agg({
-                    'Visit_ID': 'count',
-                    'Duration': 'sum'
-                }).reset_index()
+                prog_breakdown = unique_visits_df_copy.groupby('Program_Number').agg(
+                    {'Visit_ID': 'count', 'Duration': 'sum'}
+                ).reset_index()
                 prog_breakdown.columns = ['Program', 'Visits', 'Duration']
             else:
-                prog_breakdown = unique_visits_df.groupby('Program_Number').agg({
-                    'Visit_ID': 'count'
-                }).reset_index()
+                prog_breakdown = unique_visits_df.groupby('Program_Number').agg(
+                    {'Visit_ID': 'count'}
+                ).reset_index()
                 prog_breakdown.columns = ['Program', 'Visits']
-            
-            prog_breakdown = prog_breakdown.sort_values('Program')
+
+            # Sort by earliest Start time per program (handles YYYY-DDD format via _parse_obs_time)
+            if 'Start' in unique_visits_df.columns:
+                def _earliest_start(prog_num):
+                    starts = unique_visits_df.loc[unique_visits_df['Program_Number'] == prog_num, 'Start'].dropna()
+                    times = [_parse_obs_time(str(s)) for s in starts]
+                    valid = [t for t in times if t is not None]
+                    return min(valid).unix if valid else float('inf')
+
+                prog_breakdown['_sort_key'] = prog_breakdown['Program'].apply(_earliest_start)
+                prog_breakdown = prog_breakdown.sort_values('_sort_key').drop(columns='_sort_key')
+            else:
+                prog_breakdown = prog_breakdown.sort_values('Program')
             
             # Display each program
             for prog_idx, prog_row in enumerate(prog_breakdown.iterrows()):
@@ -3436,6 +3503,75 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
 """
             
             html += "    </div>\n"
+
+        # ── Program Timeline ──
+        if 'Start' in unique_visits_df.columns:
+            from datetime import datetime, timezone
+
+            def _unix_to_label(ts):
+                return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%b %d %H:%Mz')
+
+            def _merge_intervals(intervals):
+                """Merge a sorted list of (start, end) tuples into contiguous chunks."""
+                merged = []
+                for s, e in sorted(intervals):
+                    if merged and s <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                    else:
+                        merged.append([s, e])
+                return merged
+
+            # Build per-program chunks
+            prog_chunks = {}
+            for prog_idx2, prog_row2 in enumerate(prog_breakdown.iterrows()):
+                _, pr = prog_row2
+                pnum = pr['Program']
+                prog_data2 = unique_visits_df[unique_visits_df['Program_Number'] == pnum]
+                intervals = []
+                for _, vrow in prog_data2.iterrows():
+                    t = _parse_obs_time(str(vrow['Start'])) if pd.notna(vrow.get('Start')) else None
+                    if t is None:
+                        continue
+                    dur = float(pd.to_numeric(vrow.get('Duration', 0), errors='coerce') or 0)
+                    intervals.append((t.unix, t.unix + max(dur, 60)))
+                if not intervals:
+                    continue
+                prog_chunks[pnum] = {
+                    'chunks': _merge_intervals(intervals),
+                    'color': program_colors[prog_idx2 % len(program_colors)],
+                }
+
+            if prog_chunks:
+                tl_min = min(c[0] for v in prog_chunks.values() for c in v['chunks'])
+                tl_max = max(c[1] for v in prog_chunks.values() for c in v['chunks'])
+                tl_span = tl_max - tl_min if tl_max > tl_min else 1.0
+
+                html += """
+    <div class="breakdown-section">
+        <h3>📅 Program Timeline</h3>
+        <div class="timeline-container">
+            <div class="timeline-axis">
+"""
+                html += f'                <span class="timeline-tick-label" style="left:0%">{_unix_to_label(tl_min)}</span>\n'
+                html += f'                <span class="timeline-tick-label" style="left:50%;transform:translateX(-50%)">{_unix_to_label(tl_min + tl_span/2)}</span>\n'
+                html += f'                <span class="timeline-tick-label" style="right:0;transform:none">{_unix_to_label(tl_max)}</span>\n'
+                html += "            </div>\n"
+
+                for pnum, tv in prog_chunks.items():
+                    bars_html = ''
+                    for (cs, ce) in tv['chunks']:
+                        left_pct  = (cs - tl_min) / tl_span * 100
+                        width_pct = max((ce - cs) / tl_span * 100, 0.3)
+                        bars_html += (
+                            f'<div class="timeline-bar" style="left:{left_pct:.3f}%;width:{width_pct:.3f}%;background:{tv["color"]};"'
+                            f' title="Program {pnum}: {_unix_to_label(cs)} → {_unix_to_label(ce)}"></div>'
+                        )
+                    html += f"""            <div class="timeline-row">
+                <div class="timeline-label">Program {pnum}</div>
+                <div class="timeline-bar-track">{bars_html}</div>
+            </div>
+"""
+                html += "        </div>\n    </div>\n"
 
     # Add instrument breakdown if available
     if 'Science_Instrument' in df.columns:
@@ -3606,6 +3742,9 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
             return f'<span class="highlight">{html_module.escape(str(value))}</span>'
         elif col == 'Visit_File_Name' and str(value).endswith('.vst'):
             vf = str(value)
+            if not include_visit_links:
+                return html_module.escape(vf)
+
             png_path = visit_png_map.get(vf, '')
 
             # Existing: click visit name to view STOL content
@@ -3717,36 +3856,10 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
         </div>
     </div>
     
-    <!-- Modal for displaying visit file content -->
-    <div id="visitModal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2 id="modalTitle">Visit File Content</h2>
-                <div class="modal-controls">
-                    <div class="syntax-toggle">
-                        <label for="syntaxHighlight">Syntax Highlighting:</label>
-                        <input type="checkbox" id="syntaxHighlight" checked onchange="toggleSyntaxHighlighting()">
-                    </div>
-                    <span class="close" onclick="closeModal()">&times;</span>
-                </div>
-            </div>
-            <div class="modal-body">
-                <div id="scrollHint" class="scroll-hint" style="display: none;">
-                    ⟷ Scroll horizontally and vertically to view all content
-                </div>
-                <pre id="visitContentDisplay" class="visit-content"></pre>
-            </div>
-            <div class="modal-footer">
-                <div class="footer-info">
-                    <span id="fileSize"></span>
-                </div>
-                <div class="footer-buttons">
-                    <button class="copy-btn" onclick="copyToClipboard()">Copy to Clipboard</button>
-                    <button class="download-btn" onclick="downloadVisitFile()">Download</button>
-                </div>
-            </div>
-        </div>
-    </div>
+    {"<!-- Modal for displaying visit file content -->" if include_visit_links else ""}
+    {"<div id='visitModal' class='modal'>" if include_visit_links else ""}
+        {"<div class='modal-content'><div class='modal-header'><h2 id='modalTitle'>Visit File Content</h2><div class='modal-controls'><div class='syntax-toggle'><label for='syntaxHighlight'>Syntax Highlighting:</label><input type='checkbox' id='syntaxHighlight' checked onchange='toggleSyntaxHighlighting()'></div><span class='close' onclick='closeModal()'>&times;</span></div></div><div class='modal-body'><div id='scrollHint' class='scroll-hint' style='display:none;'>&#8660; Scroll horizontally and vertically to view all content</div><pre id='visitContentDisplay' class='visit-content'></pre></div><div class='modal-footer'><div class='footer-info'><span id='fileSize'></span></div><div class='footer-buttons'><button class='copy-btn' onclick='copyToClipboard()'>Copy to Clipboard</button><button class='download-btn' onclick='downloadVisitFile()'>Download</button></div></div></div>" if include_visit_links else ""}
+    {"</div>" if include_visit_links else ""}
     
     <div class="footer">
         <p>Generated by OPUP Parser | Visit files are contained in the .tgz archive</p>
@@ -3757,7 +3870,7 @@ def generate_html_report(df, opup_filepath, sky_plotter_html=None, visit_png_map
         // Store visit file contents - loaded from JSON
         const visitContentsRaw = {visit_contents_raw_json};
         const visitContentsHighlighted = {visit_contents_highlighted_json};
-        
+
         console.log('Loaded visit contents:', Object.keys(visitContentsRaw).length, 'files');
         
         let currentVisitFile = '';
@@ -4127,16 +4240,17 @@ def syntax_highlight_visit_content(content):
     
     return '\n'.join(highlighted_lines)
 
-def write_to_HTML(df, output_html, opup_filepath, keep_GW=True, 
-                  sky_plotter_html=None, visit_png_map=None):
+def write_to_HTML(df, output_html, opup_filepath, keep_GW=True,
+                  sky_plotter_html=None, visit_png_map=None, include_visit_links=True):
     """
     Write DataFrame to HTML file with optional GW column removal.
-    
+
     Args:
         df: DataFrame to export
         output_html: Path to output HTML file
         opup_filepath: Path to OPUP archive
         keep_GW: Whether to keep Guide Window columns
+        include_visit_links: Whether to add clickable links on visit file names (default True).
     """
 
     if visit_png_map is None:
@@ -4145,15 +4259,15 @@ def write_to_HTML(df, output_html, opup_filepath, keep_GW=True,
     if not keep_GW:
         gw_cols = get_current_gw_columns(df)
         df = df.drop(columns=gw_cols)
-    
-    html_content = generate_html_report(df, opup_filepath)
+
+    html_content = generate_html_report(df, opup_filepath, include_visit_links=include_visit_links)
     
     with open(output_html, 'w', encoding='utf-8') as f:
         f.write(html_content)
 
 
 # Modified process functions to add HTML export option
-def process_OPUPs_html(opup_filepaths, output_dir=None, keep_GW=True):
+def process_OPUPs_html(opup_filepaths, output_dir=None, keep_GW=True, include_visit_links=True):
     """
     Process OPUP files and generate HTML reports.
     """
@@ -4162,18 +4276,18 @@ def process_OPUPs_html(opup_filepaths, output_dir=None, keep_GW=True):
             output_dir = Path(opup_filepath).parent.as_posix()
             if not Path(output_dir).is_dir():
                 output_dir = find_nontgz_parent(output_dir)
-        
+
         output_html = Path(output_dir).joinpath(Path(opup_filepath).stem + '_report.html').as_posix()
-        
+
         # Parse the opup
         opup_info = parse_OPUP(opup_filepath)
-        
+
         # Move priority columns to the left
         opup_info = prioritize_columns(opup_info, PRIORITY_COLUMNS)
-        
+
         # Write to HTML
         if len(opup_info.columns) > 0:
-            write_to_HTML(opup_info, output_html, opup_filepath, keep_GW=keep_GW)
+            write_to_HTML(opup_info, output_html, opup_filepath, keep_GW=keep_GW, include_visit_links=include_visit_links)
         else:
             print(f'No columns were returned for {opup_filepath}')
 
@@ -4396,14 +4510,28 @@ def add_attitude_columns(df):
     pitches = []
     rolls = []
 
+    # Use first valid Start time to initialize RomanPointing (avoids ephem range errors)
+    _init_time = None
+    for _t in df['Start'].dropna():
+        _parsed = _parse_obs_time(str(_t).strip())
+        if _parsed is not None:
+            _init_time = _parsed
+            break
+    if _init_time is None:
+        _init_time = "2027-01-01 00:00:00"
+
     if Path(ephem).is_file():
         oem = _get_oem(ephem)
-        rp = RomanPointing(observation_date="2026-09-07 11:24:00", ephem_file=ephem)
+        # Construct without ephem_file to avoid a second OEMEphemeris load, then inject the cached object
+        rp = RomanPointing(observation_date=_init_time, ephem_file=None)
+        if oem is not None:
+            rp.ephem = oem
+            rp._sun_source = 'OEM'
         _sun_source = 'OEM' if oem is not None else 'JPL'
     else:
         print(f"  ⚠️  OEM ephemeris file not found ({ephem.name}); using JPL Horizons fallback for Sun position.")
         oem = None
-        rp = RomanPointing(observation_date="2026-09-07 11:24:00", ephem_file=None)
+        rp = RomanPointing(observation_date=_init_time, ephem_file=None)
         _sun_source = 'JPL'
 
 
@@ -4411,10 +4539,7 @@ def add_attitude_columns(df):
     if _sun_source == 'JPL':
         print(f"  Querying JPL Horizons for Sun position ({n_rows} rows — this may take a while)...")
 
-    for i, (idx, row) in enumerate(df.iterrows()):
-        if _sun_source == 'JPL' and n_rows > 1:
-            print(f"  Row {i+1}/{n_rows}...", end='\r', flush=True)
-
+    for _, row in tqdm(df.iterrows(), total=n_rows, desc="  Attitude columns", unit="row"):
         if any(pd.isna(row.get(c)) for c in required):
             sun_angles.append(None)
             pitches.append(None)
@@ -4518,17 +4643,19 @@ def _parse_obs_time(start_str):
 
     return None
 
-def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, generate_pngs=False):
+def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, generate_pngs=False, include_visit_links=True):
     """
     Generate both the detailed OPUP HTML report and the sky plotter visualization.
-    
+
     Args:
         opup_filepath: Path to OPUP .tgz archive
         output_dir: Output directory (defaults to same as OPUP)
         keep_GW: Whether to keep Guide Window columns
         generate_pngs: Whether to generate sky plot PNGs via roman_visit_viewer
                        (default: False, uses Aladin Lite embedded viewer instead)
-    
+        include_visit_links: Whether to add clickable links on visit file names (default True).
+                             Set to False to reduce HTML size for large OPUPs.
+
     Returns:
         Tuple of (html_report_path, sky_plotter_path, csv_path, archive_path)
     """
@@ -4624,10 +4751,12 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, gen
     step += 1
     print(f"\nStep {step}: Generating detailed HTML report...")
     html_report = output_dir / f"{opup_stem}_report.html"
+    opup_info_for_html = opup_info if keep_GW else opup_info.drop(columns=get_current_gw_columns(opup_info), errors='ignore')
     html_content = generate_html_report(
-        opup_info, opup_filepath, sky_plotter_html,
+        opup_info_for_html, opup_filepath, sky_plotter_html,
         visit_png_map=visit_png_map,
-        skyplot_mosaic_filename=skyplot_mosaic_filename
+        skyplot_mosaic_filename=skyplot_mosaic_filename,
+        include_visit_links=include_visit_links,
     )
 
     # ── Step 8b: Embed Aladin Lite sky viewer ──
@@ -4674,35 +4803,6 @@ def generate_integrated_report(opup_filepath, output_dir=None, keep_GW=True, gen
 # ═════════════════════════════════════════════════════════════════════════════
 # PART 7: COMMAND-LINE INTERFACE
 # ═════════════════════════════════════════════════════════════════════════════
-
-def setup_parser_with_html():
-    parser = argparse.ArgumentParser(description='Parse OPUP files.')
-    parser.add_argument('-opup', '--opup_filepath', type=str, nargs='+', help='Path(s) to the OPUP file(s)', default=[])
-    parser.add_argument('-opup_dir', '--opup_directory', type=str, help='Directory containing OPUP .tgz archives (will process all found)', default=None)
-    parser.add_argument('-scf', '--scf_filepath', type=str, nargs='+', help='Path(s) to the SCF file(s)', default=[])
-    parser.add_argument('-visit', '--visit_filepath', type=str, nargs='+', help='Path(s) to the visit file(s)', default=[])
-    parser.add_argument('-odir', '--output_dir', type=str, help='Output file directory', default=None)
-    parser.add_argument('--keep_GW', action='store_true', help='Keep Guide Window information in the output.')
-    parser.add_argument('--format', type=str, choices=['csv', 'html', 'both'], default='html', 
-                       help='Output format: csv, html, or both')
-    return parser
-
-
-def setup_parser():
-    parser = argparse.ArgumentParser(description='Parse OPUP files.')
-    parser.add_argument('-opup', '--opup_filepath', type=str, nargs='+', help='Path(s) to the OPUP file(s)', default=[])
-    parser.add_argument('-opup_dir', '--opup_directory', type=str, help='Directory containing OPUP .tgz archives (will process all found)', default=None)
-    parser.add_argument('-scf', '--scf_filepath', type=str, nargs='+', help='Path(s) to the SCF file(s)', default=[])
-    parser.add_argument('-visit', '--visit_filepath', type=str, nargs='+', help='Path(s) to the visit file(s)', default=[])
-    parser.add_argument('-odir', '--output_dir', type=str, help='Output file directory', default=None)
-    parser.add_argument('--keep_GW', action='store_true', help='Keep Guide Window information in the output.')
-    parser.add_argument('--pngs', action='store_true', default=False,
-                       help='Generate sky plot PNGs via roman_visit_viewer (slower, off by default)')
-    parser.add_argument('--gantt', type=str, help='Generate Gantt chart from aggregated CSV file')
-    parser.add_argument('--format', type=str, choices=['csv', 'html', 'both', 'integrated'], default='integrated', 
-                       help='Output format: csv, html, both, or integrated (html + sky plot)')
-    return parser
-
 
 def find_opup_files_in_directory(directory):
     """
@@ -5550,6 +5650,8 @@ def setup_parser():
     parser.add_argument('--format', type=str, choices=['csv', 'html', 'both', 'integrated'],
                         default='integrated',
                         help='Output format (default: integrated)')
+    parser.add_argument('--no-visit-links', action='store_true', default=False,
+                        help='Omit clickable links on visit file names (reduces HTML file size for large OPUPs)')
     return parser
 
 def main():
@@ -5564,6 +5666,7 @@ def main():
     output_dir = args.output_dir
     keep_GW = args.keep_GW
     output_format = args.format
+    include_visit_links = not args.no_visit_links
     
     # If -opup_dir is provided, find all OPUP files in that directory
     directory_mode = False
@@ -5582,7 +5685,7 @@ def main():
     if output_format == 'integrated':
         # Generate integrated report with sky plotter
         for opup_filepath in opup_filepaths:
-            generate_integrated_report(opup_filepath, output_dir, keep_GW, generate_pngs=args.pngs)
+            generate_integrated_report(opup_filepath, output_dir, keep_GW, generate_pngs=args.pngs, include_visit_links=include_visit_links)
         
         # If in directory mode, also generate aggregated output
         if directory_mode and len(opup_filepaths) > 1:
@@ -5626,7 +5729,7 @@ def main():
             process_visits(visit_filepaths, output_dir, keep_GW)
         
         if output_format in ['html', 'both']:
-            process_OPUPs_html(opup_filepaths, output_dir, keep_GW)
+            process_OPUPs_html(opup_filepaths, output_dir, keep_GW, include_visit_links=include_visit_links)
 
 if __name__ == '__main__':
     main()

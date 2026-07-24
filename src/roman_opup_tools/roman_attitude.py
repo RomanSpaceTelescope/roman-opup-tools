@@ -15,7 +15,10 @@ import datetime
 import pandas as pd
 import pysiaf
 from scipy.interpolate import CubicSpline
-from astroquery.jplhorizons import Horizons
+import warnings as _warnings
+with _warnings.catch_warnings():
+    _warnings.filterwarnings("ignore", message=".*astropy.samp.*")
+    from astroquery.jplhorizons import Horizons
 from datetime import datetime, timedelta
 import re
 
