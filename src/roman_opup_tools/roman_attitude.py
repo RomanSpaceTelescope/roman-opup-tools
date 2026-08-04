@@ -638,6 +638,205 @@ def create_subplot_grid(n_plots, figsize_per_plot=(4, 3), max_cols=None,
     return fig, axes[:n_plots]  # Return only the axes we need
 
 # ═════════════════════════════════════════════════════════════════════════════
+# AVAILABILITY PLOT
+# ═════════════════════════════════════════════════════════════════════════════
+
+def plot_roman_availability(observation_date, ax=None,
+                            show_ecliptic=True, show_cvz=True, show_sun=True,
+                            pitch_limit=36.0, roll_limit=15.0,
+                            frame='icrs', fig_size=(12, 6),
+                            target=None, n_grid=360):
+    """
+    Create a Roman sky-availability Mollweide map for a given date.
+
+    The observable zone is the band where |pitch| ≤ pitch_limit, where
+    pitch = sun_angle − 90°.  Within that band the map is colored by
+    pitch angle (blue = toward Sun, red = away from Sun, white = sun-normal).
+    Unobservable regions are shown in gray.
+
+    The roll constraint (±roll_limit) limits available position angles for
+    each target but does not restrict which targets can be reached; it is
+    shown in the title as an annotation only.
+
+    Parameters
+    ----------
+    observation_date : str, datetime, or astropy.time.Time
+        Epoch for computing the Sun position.
+    ax : matplotlib.axes.Axes, optional
+        Mollweide axes to draw on.  A new figure is created if None.
+    show_ecliptic : bool
+        Draw the ecliptic plane.  Default True.
+    show_cvz : bool
+        Draw ±54° ecliptic-latitude CVZ boundaries.  Default True.
+    show_sun : bool
+        Mark the Sun position.  Default True.
+    pitch_limit : float
+        Half-width of the observable pitch band in degrees.  Default 36.
+    roll_limit : float
+        Spacecraft roll limit in degrees (annotated only).  Default 15.
+    frame : str
+        Sky frame for the map: ``'icrs'`` or ``'galactic'``.  Default ``'icrs'``.
+    fig_size : tuple
+        Figure size (width, height) in inches.  Default (12, 6).
+    target : SkyCoord, optional
+        Additional target to mark on the map.
+    n_grid : int
+        Number of longitude pixels in the sky grid.  Default 360.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    ax  : matplotlib.axes.Axes
+    """
+    if isinstance(observation_date, str):
+        t = Time(observation_date)
+    elif isinstance(observation_date, datetime):
+        t = Time(observation_date)
+    else:
+        t = observation_date
+
+    # Sun position (GCRS, sufficient accuracy for a sky map)
+    sun_gcrs = get_sun(t)
+    sun_icrs = SkyCoord(ra=sun_gcrs.ra, dec=sun_gcrs.dec, frame='icrs')
+
+    # Regular sky grid in the display frame, centered for Mollweide
+    n_lat = n_grid // 2
+    lon_lin = np.linspace(-180.0, 180.0, n_grid)   # wrap_at(180) convention
+    lat_lin = np.linspace(-90.0, 90.0, n_lat)
+    LON_c, LAT_c = np.meshgrid(lon_lin, lat_lin)
+
+    # Build SkyCoord grid and compute sun-angle map
+    if frame == 'galactic':
+        l_actual = ((LON_c.ravel() + 360.0) % 360.0)
+        grid_sc = SkyCoord(l=l_actual * u.deg,
+                           b=LAT_c.ravel() * u.deg, frame='galactic')
+    else:
+        ra_actual = ((LON_c.ravel() + 360.0) % 360.0)
+        grid_sc = SkyCoord(ra=ra_actual * u.deg,
+                           dec=LAT_c.ravel() * u.deg, frame='icrs')
+
+    sun_angle_map = sun_icrs.separation(grid_sc).deg.reshape(LON_c.shape)
+    pitch_map = sun_angle_map - 90.0                       # deg; 0 = sun-normal
+    visible = np.abs(pitch_map) <= pitch_limit
+    pitch_display = np.where(visible, pitch_map, np.nan)
+
+    # Figure and axes
+    created_fig = ax is None
+    if created_fig:
+        fig, ax = plt.subplots(figsize=fig_size,
+                               subplot_kw={'projection': 'mollweide'})
+    else:
+        fig = ax.figure
+
+    LON_rad = np.deg2rad(LON_c)
+    LAT_rad = np.deg2rad(LAT_c)
+
+    # Observable zone colored by pitch (RdBu_r: red = toward Sun, blue = away)
+    im = ax.pcolormesh(LON_rad, LAT_rad, pitch_display,
+                       cmap='RdBu_r', vmin=-pitch_limit, vmax=pitch_limit,
+                       shading='auto', zorder=2)
+
+    # Unobservable zone in gray
+    gray = np.where(~visible, 1.0, np.nan)
+    ax.pcolormesh(LON_rad, LAT_rad, gray,
+                  cmap='Greys', vmin=0, vmax=2, alpha=0.35,
+                  shading='auto', zorder=1)
+
+    # Boundary at ±pitch_limit (solid) and sun-normal at pitch=0 (dashed)
+    ax.contour(LON_rad, LAT_rad, pitch_map,
+               levels=[-pitch_limit, pitch_limit],
+               colors='k', linewidths=1.5, zorder=4)
+    ax.contour(LON_rad, LAT_rad, pitch_map,
+               levels=[0], colors='w', linewidths=1.0,
+               linestyles='--', alpha=0.8, zorder=4)
+
+    if created_fig:
+        cbar = fig.colorbar(im, ax=ax, orientation='horizontal',
+                            fraction=0.04, pad=0.09, shrink=0.55)
+        cbar.set_label('Pitch angle (deg)', fontsize=10)
+
+    # Ecliptic
+    if show_ecliptic:
+        ecl_sc = SkyCoord(
+            lon=np.linspace(0, 360, 720) * u.deg,
+            lat=np.zeros(720) * u.deg,
+            frame='barycentricmeanecliptic', obstime=t)
+        if frame == 'galactic':
+            ep = ecl_sc.transform_to('galactic')
+            ex = ep.l.wrap_at(180 * u.deg).deg
+            ey = ep.b.deg
+        else:
+            ep = ecl_sc.transform_to('icrs')
+            ex = ep.ra.wrap_at(180 * u.deg).deg
+            ey = ep.dec.deg
+        si = np.argsort(ex)
+        ax.plot(np.deg2rad(ex[si]), np.deg2rad(ey[si]),
+                color='darkorange', lw=1.5, label='Ecliptic', zorder=5)
+
+    # CVZ boundaries (|ecliptic latitude| = 54°)
+    if show_cvz:
+        for cvz_lat in (-54, 54):
+            cvz_sc = SkyCoord(
+                lon=np.linspace(0, 360, 720) * u.deg,
+                lat=np.full(720, cvz_lat) * u.deg,
+                frame='barycentricmeanecliptic')
+            if frame == 'galactic':
+                cp = cvz_sc.transform_to('galactic')
+                cx = cp.l.wrap_at(180 * u.deg).deg
+                cy = cp.b.deg
+            else:
+                cp = cvz_sc.transform_to('icrs')
+                cx = cp.ra.wrap_at(180 * u.deg).deg
+                cy = cp.dec.deg
+            si = np.argsort(cx)
+            label = 'CVZ (|ecl. lat| = 54°)' if cvz_lat == 54 else None
+            ax.plot(np.deg2rad(cx[si]), np.deg2rad(cy[si]),
+                    'g--', lw=1.0, alpha=0.8, label=label, zorder=5)
+
+    # Sun
+    if show_sun:
+        if frame == 'galactic':
+            sg = sun_icrs.transform_to('galactic')
+            sx = sg.l.wrap_at(180 * u.deg).deg
+            sy = sg.b.deg
+        else:
+            sx = sun_icrs.ra.wrap_at(180 * u.deg).deg
+            sy = sun_icrs.dec.deg
+        ax.scatter(np.deg2rad(sx), np.deg2rad(sy),
+                   s=300, c='yellow', marker='*',
+                   edgecolors='orange', linewidths=2,
+                   zorder=6, label='Sun')
+
+    # Optional target marker
+    if target is not None:
+        if frame == 'galactic':
+            tg = target.transform_to('galactic')
+            tx = tg.l.wrap_at(180 * u.deg).deg
+            ty = tg.b.deg
+        else:
+            tx = target.ra.wrap_at(180 * u.deg).deg
+            ty = target.dec.deg
+        ax.scatter(np.deg2rad(tx), np.deg2rad(ty),
+                   s=150, c='red', marker='*',
+                   edgecolors='darkred', linewidths=2,
+                   zorder=6, label='Target')
+
+    frame_label = 'ICRS' if frame == 'icrs' else 'Galactic'
+    date_str = t.datetime.strftime('%Y-%m-%d')
+    ax.set_title(
+        f'Roman Availability — {date_str} ({frame_label})\n'
+        f'Observable: |pitch| ≤ {pitch_limit}°  |  Roll ±{roll_limit}°',
+        fontsize=11)
+    ax.legend(loc='lower right', fontsize=8, framealpha=0.8)
+    ax.grid(True, alpha=0.3)
+
+    if created_fig:
+        plt.tight_layout()
+
+    return fig, ax
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # QUATERNION TO ATTITUDE CONVERSION
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1905,6 +2104,441 @@ def main():
 
     print('Matrix math was successfully checked against pysiaf')
 
+
+
+def plot_pa_availability(ra, dec, year=None,
+                         pitch_limit=36.0, roll_limit=15.0,
+                         n_days=365, n_rolls=61,
+                         ax=None, fig_size=(12, 5),
+                         label=None):
+    """
+    Plot available V3 position angles for a target over a full year.
+
+    For each day the Sun position is computed and the pitch angle to the
+    target is checked.  On observable days (|pitch| ≤ pitch_limit) the
+    range of reachable V3PAs is [nominal_PA − roll_limit,
+    nominal_PA + roll_limit], where nominal_PA is the PA at zero roll.
+
+    Parameters
+    ----------
+    ra : float
+        Target right ascension in degrees (ICRS).
+    dec : float
+        Target declination in degrees (ICRS).
+    year : int, optional
+        Calendar year to survey.  Defaults to the current year.
+    pitch_limit : float
+        Observable pitch half-width in degrees.  Default 36.
+    roll_limit : float
+        Spacecraft roll limit in degrees.  Default 15.
+    n_days : int
+        Number of days to sample across the year.  Default 365.
+    n_rolls : int
+        Number of roll-angle samples within ±roll_limit per observable day
+        (used to trace the PA band edges).  Default 61.
+    ax : matplotlib.axes.Axes, optional
+        Axes to draw on.  A new figure is created if None.
+    fig_size : tuple
+        Figure size in inches.  Default (12, 5).
+    label : str, optional
+        Target name for the plot title.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    ax  : matplotlib.axes.Axes
+    df  : pandas.DataFrame
+        Per-day table with columns: ``date``, ``pitch_deg``, ``visible``,
+        ``pa_nominal``, ``pa_min``, ``pa_max``.
+    """
+    if year is None:
+        from datetime import date
+        year = date.today().year
+
+    t0 = Time(f'{year}-01-01')
+    days = np.linspace(0, 364.9, n_days)
+    times = t0 + TimeDelta(days * u.day)
+
+    target_sc = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame='icrs')
+    target_vec = target_sc.cartesian.xyz.value
+    target_vec = target_vec / np.linalg.norm(target_vec)
+
+    # Vectorised Sun positions using astropy built-in ephemeris
+    with solar_system_ephemeris.set('builtin'):
+        suns = get_sun(times)   # GeocentricMeanEcliptic → converted below
+    sun_sc = SkyCoord(ra=suns.ra, dec=suns.dec, frame='icrs')
+
+    sun_vecs = np.column_stack([
+        sun_sc.cartesian.x.value,
+        sun_sc.cartesian.y.value,
+        sun_sc.cartesian.z.value,
+    ])  # (n_days, 3)
+
+    sun_angles = np.degrees(np.arccos(
+        np.clip(sun_vecs @ target_vec, -1.0, 1.0)
+    ))
+    pitches = sun_angles - 90.0
+    visible = np.abs(pitches) <= pitch_limit
+
+    # For each day compute nominal PA (roll=0) and PA band edges
+    north = np.array([0.0, 0.0, 1.0])
+    rolls_rad = np.linspace(-np.radians(roll_limit),
+                             np.radians(roll_limit), n_rolls)
+
+    pa_nominal = np.full(n_days, np.nan)
+    pa_min     = np.full(n_days, np.nan)
+    pa_max     = np.full(n_days, np.nan)
+
+    for i in np.where(visible)[0]:
+        sv = sun_vecs[i]
+        sv = sv / np.linalg.norm(sv)
+
+        # Replicate _calculate_pointing_attitude at roll=0
+        x_axis = target_vec.copy()
+        temp_y = np.cross(sv, x_axis)
+        norm_ty = np.linalg.norm(temp_y)
+        if norm_ty < 1e-6:
+            temp_y = np.array([0.0, 1.0, 0.0]) if abs(x_axis[1]) < 0.9 \
+                     else np.array([1.0, 0.0, 0.0])
+            norm_ty = np.linalg.norm(temp_y)
+        y_axis = temp_y / norm_ty
+        z_axis = np.cross(x_axis, y_axis)
+        if np.dot(z_axis, sv) < 0:
+            z_axis = -z_axis
+            y_axis = -y_axis
+        att0 = np.column_stack([x_axis, y_axis, z_axis])
+
+        # Roll rotation matrix about X axis
+        pa_samples = []
+        for roll_rad in rolls_rad:
+            cr, sr = np.cos(roll_rad), np.sin(roll_rad)
+            roll_mat = np.array([[1, 0, 0],
+                                 [0, cr, -sr],
+                                 [0, sr,  cr]])
+            att = att0 @ roll_mat
+
+            # Replicate get_position_angle
+            xa = att[:, 0]
+            za = att[:, 2]
+            n1 = np.cross(xa, north)
+            n1_norm = np.linalg.norm(n1)
+            if n1_norm < 1e-9:
+                continue
+            n1 /= n1_norm
+            n2 = np.cross(xa, za)
+            n2_norm = np.linalg.norm(n2)
+            if n2_norm < 1e-9:
+                continue
+            n2 /= n2_norm
+            cos_a = np.clip(np.dot(n1, n2), -1.0, 1.0)
+            sign = -np.sign(np.dot(xa, np.cross(n1, n2)))
+            pa = np.degrees(sign * np.arccos(cos_a)) % 360
+            pa_samples.append(pa)
+
+        if not pa_samples:
+            continue
+
+        # Nominal PA is at zero roll (middle sample)
+        pa_nominal[i] = pa_samples[n_rolls // 2]
+
+        # Handle 360/0 wrap: if spread > 180 assume wrapping band
+        pa_arr = np.array(pa_samples)
+        spread = np.max(pa_arr) - np.min(pa_arr)
+        if spread > 180:
+            # shift values below 180 up by 360, then unwrap
+            pa_arr = np.where(pa_arr < 180, pa_arr + 360, pa_arr)
+        pa_min[i] = np.min(pa_arr) % 360
+        pa_max[i] = np.max(pa_arr) % 360
+
+    # Build result table
+    date_list = [t.datetime.strftime('%Y-%m-%d') for t in times]
+    df = pd.DataFrame({
+        'date':      date_list,
+        'pitch_deg': pitches,
+        'visible':   visible,
+        'pa_nominal': pa_nominal,
+        'pa_min':     pa_min,
+        'pa_max':     pa_max,
+    })
+
+    # ── Plotting ──────────────────────────────────────────────────────────
+    created_fig = ax is None
+    if created_fig:
+        fig, ax = plt.subplots(figsize=fig_size)
+    else:
+        fig = ax.figure
+
+    doys = days + 1  # day-of-year (1-based)
+    vis_doys = doys[visible]
+
+    # Shade the PA band; handle wrap-around by splitting at 360/0
+    vis_min = pa_min[visible]
+    vis_max = pa_max[visible]
+
+    # Detect wrapped segments: where pa_max < pa_min the band crosses 0°
+    wrapped = vis_max < vis_min
+
+    # Draw unwrapped segments as a filled band
+    if np.any(~wrapped):
+        uw = ~wrapped
+        ax.fill_between(vis_doys[uw], vis_min[uw], vis_max[uw],
+                        alpha=0.3, color='steelblue', label=f'Accessible PA (±{roll_limit}° roll)')
+    # Draw wrapped segments as two separate fills
+    if np.any(wrapped):
+        w = wrapped
+        ax.fill_between(vis_doys[w], vis_min[w], 360.0,
+                        alpha=0.3, color='steelblue')
+        ax.fill_between(vis_doys[w], 0.0, vis_max[w],
+                        alpha=0.3, color='steelblue')
+
+    # Nominal PA spine
+    ax.plot(doys[visible], pa_nominal[visible],
+            color='steelblue', lw=1.5, label='Nominal PA (zero roll)')
+
+    # Mark windows: shade background for visible/invisible
+    vis_changes = np.diff(visible.astype(int), prepend=0, append=0)
+    starts = np.where(vis_changes == 1)[0]
+    ends   = np.where(vis_changes == -1)[0]
+    for s, e in zip(starts, ends):
+        ax.axvspan(doys[s], doys[e - 1], alpha=0.07, color='green')
+
+    # Month tick marks
+    month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    month_doys = []
+    for m in range(1, 13):
+        month_doys.append(Time(f'{year}-{m:02d}-01').jd - t0.jd + 1)
+    ax.set_xticks(month_doys)
+    ax.set_xticklabels(month_names)
+
+    ax.set_xlim(1, 366)
+    ax.set_ylim(-5, 365)
+    ax.set_yticks(np.arange(0, 361, 45))
+    ax.set_ylabel('V3 Position Angle (deg)')
+    ax.set_xlabel(f'Date ({year})')
+
+    name_str = label if label else f'RA={ra:.4f}°, Dec={dec:+.4f}°'
+    ax.set_title(
+        f'Roman PA Availability — {name_str}\n'
+        f'|pitch| ≤ {pitch_limit}°  |  Roll ±{roll_limit}°  |  {year}'
+    )
+    ax.legend(loc='upper right', fontsize=9)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    if created_fig:
+        plt.tight_layout()
+
+    return fig, ax, df
+
+
+def availability_main():
+    """
+    CLI entry point: roman-availability
+
+    Examples
+    --------
+    roman-availability 2026-11-21
+    roman-availability 2027-03-15 --frame galactic --no-ecliptic --output avail.png
+    roman-availability 2026-11-21 --target 83.82 -5.39 --dpi 150
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog='roman-availability',
+        description='Plot Roman Space Telescope sky availability for a given date.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  roman-availability 2026-11-21
+  roman-availability 2027-03-15 --frame galactic --output avail.png
+  roman-availability 2026-11-21 --target 83.82 -5.39 --no-cvz
+  roman-availability 2026-11-21 --pitch-limit 36 --roll-limit 15 --dpi 200
+        """,
+    )
+
+    parser.add_argument(
+        'date',
+        type=str,
+        help='Observation date in ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS).',
+    )
+    parser.add_argument(
+        '--frame',
+        type=str,
+        choices=['icrs', 'galactic'],
+        default='icrs',
+        help='Sky coordinate frame for the map (default: icrs).',
+    )
+    parser.add_argument(
+        '--pitch-limit',
+        type=float,
+        default=36.0,
+        metavar='DEG',
+        help='Observable pitch half-width in degrees (default: 36).',
+    )
+    parser.add_argument(
+        '--roll-limit',
+        type=float,
+        default=15.0,
+        metavar='DEG',
+        help='Roll limit in degrees, annotated in title (default: 15).',
+    )
+    parser.add_argument(
+        '--no-ecliptic',
+        action='store_true',
+        help='Suppress ecliptic plane overlay.',
+    )
+    parser.add_argument(
+        '--no-cvz',
+        action='store_true',
+        help='Suppress CVZ boundary overlay.',
+    )
+    parser.add_argument(
+        '--no-sun',
+        action='store_true',
+        help='Suppress Sun marker.',
+    )
+    parser.add_argument(
+        '--target',
+        type=float,
+        nargs=2,
+        metavar=('RA_DEG', 'DEC_DEG'),
+        default=None,
+        help='Mark a target on the map (RA Dec in degrees, ICRS).',
+    )
+    parser.add_argument(
+        '--output', '-o',
+        type=str,
+        default=None,
+        metavar='FILE',
+        help='Save figure to FILE instead of displaying it (e.g. avail.png).',
+    )
+    parser.add_argument(
+        '--dpi',
+        type=int,
+        default=150,
+        help='DPI for saved figure (default: 150).',
+    )
+    parser.add_argument(
+        '--figsize',
+        type=float,
+        nargs=2,
+        metavar=('W', 'H'),
+        default=(12, 6),
+        help='Figure size in inches (default: 12 6).',
+    )
+
+    args = parser.parse_args()
+
+    target_sc = None
+    if args.target is not None:
+        target_sc = SkyCoord(ra=args.target[0] * u.deg,
+                             dec=args.target[1] * u.deg, frame='icrs')
+
+    fig, _ = plot_roman_availability(
+        observation_date=args.date,
+        frame=args.frame,
+        pitch_limit=args.pitch_limit,
+        roll_limit=args.roll_limit,
+        show_ecliptic=not args.no_ecliptic,
+        show_cvz=not args.no_cvz,
+        show_sun=not args.no_sun,
+        target=target_sc,
+        fig_size=tuple(args.figsize),
+    )
+
+    if args.output:
+        fig.savefig(args.output, dpi=args.dpi, bbox_inches='tight')
+        print(f'Saved to {args.output}')
+    else:
+        plt.show()
+
+
+def pa_main():
+    """
+    CLI entry point: roman-pa-availability
+
+    Examples
+    --------
+    roman-pa-availability 83.82 -5.39
+    roman-pa-availability 83.82 -5.39 --year 2027 --label "Orion Nebula"
+    roman-pa-availability 83.82 -5.39 --output pa.png --csv pa.csv
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog='roman-pa-availability',
+        description='Plot Roman V3 position-angle availability for a target over a year.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  roman-pa-availability 83.82 -5.39
+  roman-pa-availability 83.82 -5.39 --year 2027 --label "Orion Nebula"
+  roman-pa-availability 83.82 -5.39 --output pa.png --csv pa.csv
+  roman-pa-availability 83.82 -5.39 --pitch-limit 36 --roll-limit 15
+        """,
+    )
+
+    parser.add_argument('ra',  type=float, help='Target RA in degrees (ICRS).')
+    parser.add_argument('dec', type=float, help='Target Dec in degrees (ICRS).')
+    parser.add_argument(
+        '--year', type=int, default=None,
+        help='Calendar year to survey (default: current year).',
+    )
+    parser.add_argument(
+        '--label', type=str, default=None, metavar='NAME',
+        help='Target name for the plot title.',
+    )
+    parser.add_argument(
+        '--pitch-limit', type=float, default=36.0, metavar='DEG',
+        help='Observable pitch half-width in degrees (default: 36).',
+    )
+    parser.add_argument(
+        '--roll-limit', type=float, default=15.0, metavar='DEG',
+        help='Spacecraft roll limit in degrees (default: 15).',
+    )
+    parser.add_argument(
+        '--n-days', type=int, default=365, metavar='N',
+        help='Number of days sampled across the year (default: 365).',
+    )
+    parser.add_argument(
+        '--output', '-o', type=str, default=None, metavar='FILE',
+        help='Save figure to FILE instead of displaying it (e.g. pa.png).',
+    )
+    parser.add_argument(
+        '--csv', type=str, default=None, metavar='FILE',
+        help='Save per-day table to a CSV file.',
+    )
+    parser.add_argument(
+        '--dpi', type=int, default=150,
+        help='DPI for saved figure (default: 150).',
+    )
+    parser.add_argument(
+        '--figsize', type=float, nargs=2, metavar=('W', 'H'), default=(12, 5),
+        help='Figure size in inches (default: 12 5).',
+    )
+
+    args = parser.parse_args()
+
+    fig, _, df = plot_pa_availability(
+        ra=args.ra,
+        dec=args.dec,
+        year=args.year,
+        pitch_limit=args.pitch_limit,
+        roll_limit=args.roll_limit,
+        n_days=args.n_days,
+        fig_size=tuple(args.figsize),
+        label=args.label,
+    )
+
+    if args.csv:
+        df.to_csv(args.csv, index=False)
+        print(f'Table saved to {args.csv}')
+
+    if args.output:
+        fig.savefig(args.output, dpi=args.dpi, bbox_inches='tight')
+        print(f'Figure saved to {args.output}')
+    else:
+        plt.show()
 
 
 if __name__ == "__main__":

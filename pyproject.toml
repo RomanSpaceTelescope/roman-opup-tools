@@ -26,6 +26,8 @@ dev = [
 
 [project.scripts]
 opup-report = "roman_opup_tools.opup_report:main"
+roman-availability = "roman_opup_tools.roman_attitude:availability_main"
+roman-pa-availability = "roman_opup_tools.roman_attitude:pa_main"
 
 [project.urls]
 Repository = "https://github.com/RomanSpaceTelescope/roman-opup-tools"
