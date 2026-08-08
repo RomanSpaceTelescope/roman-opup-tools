@@ -2110,7 +2110,7 @@ def plot_pa_availability(ra, dec, year=None,
                          pitch_limit=36.0, roll_limit=15.0,
                          n_days=365, n_rolls=61,
                          ax=None, fig_size=(12, 5),
-                         label=None):
+                         label=None, pa=None, pa_tol=1.0):
     """
     Plot available V3 position angles for a target over a full year.
 
@@ -2118,6 +2118,10 @@ def plot_pa_availability(ra, dec, year=None,
     target is checked.  On observable days (|pitch| ≤ pitch_limit) the
     range of reachable V3PAs is [nominal_PA − roll_limit,
     nominal_PA + roll_limit], where nominal_PA is the PA at zero roll.
+
+    When ``pa`` is supplied, days where that specific PA falls inside the
+    accessible band are highlighted and a ``pa_available`` column is added
+    to the returned DataFrame.
 
     Parameters
     ----------
@@ -2142,6 +2146,13 @@ def plot_pa_availability(ra, dec, year=None,
         Figure size in inches.  Default (12, 5).
     label : str, optional
         Target name for the plot title.
+    pa : float, optional
+        Requested V3 position angle in degrees [0, 360).  When provided,
+        days where this PA is reachable are highlighted on the plot and
+        flagged in the ``pa_available`` column of the returned DataFrame.
+    pa_tol : float
+        Tolerance in degrees for the PA check (circular distance).
+        Default 1.0°.  Has no effect when ``pa`` is None.
 
     Returns
     -------
@@ -2149,7 +2160,8 @@ def plot_pa_availability(ra, dec, year=None,
     ax  : matplotlib.axes.Axes
     df  : pandas.DataFrame
         Per-day table with columns: ``date``, ``pitch_deg``, ``visible``,
-        ``pa_nominal``, ``pa_min``, ``pa_max``.
+        ``pa_nominal``, ``pa_min``, ``pa_max``.  When ``pa`` is provided,
+        an additional boolean column ``pa_available`` is included.
     """
     if year is None:
         from datetime import date
@@ -2232,8 +2244,8 @@ def plot_pa_availability(ra, dec, year=None,
             n2 /= n2_norm
             cos_a = np.clip(np.dot(n1, n2), -1.0, 1.0)
             sign = -np.sign(np.dot(xa, np.cross(n1, n2)))
-            pa = np.degrees(sign * np.arccos(cos_a)) % 360
-            pa_samples.append(pa)
+            pa_val = np.degrees(sign * np.arccos(cos_a)) % 360
+            pa_samples.append(pa_val)
 
         if not pa_samples:
             continue
@@ -2260,6 +2272,23 @@ def plot_pa_availability(ra, dec, year=None,
         'pa_min':     pa_min,
         'pa_max':     pa_max,
     })
+
+    # PA-specific availability column
+    if pa is not None:
+        pa_norm = float(pa) % 360.0
+        pa_avail = np.zeros(n_days, dtype=bool)
+        for i in np.where(visible)[0]:
+            lo, hi = pa_min[i], pa_max[i]
+            if np.isnan(lo):
+                continue
+            if hi >= lo:
+                # Unwrapped band: check if pa_norm is within [lo, hi]
+                pa_avail[i] = lo - pa_tol <= pa_norm <= hi + pa_tol
+            else:
+                # Wrapped band crosses 0°/360°: in [lo, 360) or [0, hi]
+                pa_avail[i] = (pa_norm >= lo - pa_tol or
+                               pa_norm <= hi + pa_tol)
+        df['pa_available'] = pa_avail
 
     # ── Plotting ──────────────────────────────────────────────────────────
     created_fig = ax is None
@@ -2317,10 +2346,31 @@ def plot_pa_availability(ra, dec, year=None,
     ax.set_ylabel('V3 Position Angle (deg)')
     ax.set_xlabel(f'Date ({year})')
 
+    # Requested-PA overlay
+    if pa is not None:
+        pa_norm = float(pa) % 360.0
+        pa_avail_mask = df['pa_available'].values
+
+        # Highlight days where the requested PA is reachable
+        avail_changes = np.diff(pa_avail_mask.astype(int), prepend=0, append=0)
+        av_starts = np.where(avail_changes == 1)[0]
+        av_ends   = np.where(avail_changes == -1)[0]
+        first_span = True
+        for s, e in zip(av_starts, av_ends):
+            ax.axvspan(doys[s], doys[min(e, n_days - 1)],
+                       alpha=0.25, color='tomato',
+                       label='PA available' if first_span else None)
+            first_span = False
+
+        # Horizontal line at the requested PA
+        ax.axhline(pa_norm, color='tomato', lw=1.5, ls='--',
+                   label=f'Requested PA = {pa_norm:.1f}°')
+
     name_str = label if label else f'RA={ra:.4f}°, Dec={dec:+.4f}°'
+    pa_str = f'  |  PA={pa % 360:.1f}°' if pa is not None else ''
     ax.set_title(
         f'Roman PA Availability — {name_str}\n'
-        f'|pitch| ≤ {pitch_limit}°  |  Roll ±{roll_limit}°  |  {year}'
+        f'|pitch| ≤ {pitch_limit}°  |  Roll ±{roll_limit}°{pa_str}  |  {year}'
     )
     ax.legend(loc='upper right', fontsize=9)
     ax.grid(True, alpha=0.3, axis='y')
@@ -2329,6 +2379,51 @@ def plot_pa_availability(ra, dec, year=None,
         plt.tight_layout()
 
     return fig, ax, df
+
+
+def _parse_angle(tokens, is_ra=False):
+    """
+    Parse an angle from one or three tokens into decimal degrees.
+
+    Accepted formats
+    ----------------
+    Single token (already decimal):
+        "83.82"   "-5.39"   "+44.707"
+
+    Three tokens (sexagesimal):
+        RA  — "14" "26" "9.7070"   → hours × 15 + …
+        Dec — "+44" "42" "27.42"   or "-5" "23" "10.0"
+
+    The sign on the first token applies to the whole value.
+    For RA the three numbers are hour / minute / second; for Dec they are
+    degree / arcminute / arcsecond.
+
+    Parameters
+    ----------
+    tokens : list[str]
+        Either 1 or 3 string tokens.
+    is_ra : bool
+        True when parsing RA (sexagesimal tokens are HMS, not DMS).
+
+    Returns
+    -------
+    float
+        Decimal degrees.
+    """
+    if len(tokens) == 1:
+        return float(tokens[0])
+
+    if len(tokens) == 3:
+        sign = -1.0 if tokens[0].lstrip().startswith('-') else 1.0
+        d = abs(float(tokens[0]))
+        m = float(tokens[1])
+        s = float(tokens[2])
+        decimal = d + m / 60.0 + s / 3600.0
+        if is_ra:
+            decimal *= 15.0      # hours → degrees
+        return sign * decimal
+
+    raise ValueError(f'Expected 1 or 3 tokens for angle, got {len(tokens)}: {tokens}')
 
 
 def availability_main():
@@ -2340,6 +2435,7 @@ def availability_main():
     roman-availability 2026-11-21
     roman-availability 2027-03-15 --frame galactic --no-ecliptic --output avail.png
     roman-availability 2026-11-21 --target 83.82 -5.39 --dpi 150
+    roman-availability 2026-11-21 --target "14 26 9.707" "+44 42 27.42"
     """
     import argparse
 
@@ -2352,6 +2448,7 @@ Examples:
   roman-availability 2026-11-21
   roman-availability 2027-03-15 --frame galactic --output avail.png
   roman-availability 2026-11-21 --target 83.82 -5.39 --no-cvz
+  roman-availability 2026-11-21 --target "14 26 9.707" "+44 42 27.42"
   roman-availability 2026-11-21 --pitch-limit 36 --roll-limit 15 --dpi 200
         """,
     )
@@ -2399,11 +2496,16 @@ Examples:
     )
     parser.add_argument(
         '--target',
-        type=float,
-        nargs=2,
-        metavar=('RA_DEG', 'DEC_DEG'),
+        type=str,
+        nargs='+',
+        metavar='TOKEN',
         default=None,
-        help='Mark a target on the map (RA Dec in degrees, ICRS).',
+        help=(
+            'Mark a target on the map (ICRS). '
+            'Decimal degrees: --target 83.82 -5.39  '
+            'Sexagesimal: --target "14 26 9.707" "+44 42 27.42"  '
+            'or six tokens: --target 14 26 9.707 +44 42 27.42'
+        ),
     )
     parser.add_argument(
         '--output', '-o',
@@ -2431,8 +2533,21 @@ Examples:
 
     target_sc = None
     if args.target is not None:
-        target_sc = SkyCoord(ra=args.target[0] * u.deg,
-                             dec=args.target[1] * u.deg, frame='icrs')
+        tokens = args.target
+        # Split any space-separated tokens that arrived as single strings
+        tokens = [t for raw in tokens for t in raw.split()]
+        if len(tokens) == 2:
+            ra_deg  = _parse_angle(tokens[0:1], is_ra=False)
+            dec_deg = _parse_angle(tokens[1:2], is_ra=False)
+        elif len(tokens) == 6:
+            ra_deg  = _parse_angle(tokens[0:3], is_ra=True)
+            dec_deg = _parse_angle(tokens[3:6], is_ra=False)
+        else:
+            parser.error(
+                f'--target requires 2 tokens (decimal degrees) or 6 tokens '
+                f'(RA h m s Dec d m s), got {len(tokens)}: {tokens}'
+            )
+        target_sc = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame='icrs')
 
     fig, _ = plot_roman_availability(
         observation_date=args.date,
@@ -2461,7 +2576,8 @@ def pa_main():
     --------
     roman-pa-availability 83.82 -5.39
     roman-pa-availability 83.82 -5.39 --year 2027 --label "Orion Nebula"
-    roman-pa-availability 83.82 -5.39 --output pa.png --csv pa.csv
+    roman-pa-availability "14 26 9.707" "+44 42 27.42"
+    roman-pa-availability 14 26 9.707 +44 42 27.42
     """
     import argparse
 
@@ -2473,13 +2589,25 @@ def pa_main():
 Examples:
   roman-pa-availability 83.82 -5.39
   roman-pa-availability 83.82 -5.39 --year 2027 --label "Orion Nebula"
+  roman-pa-availability "14 26 9.707" "+44 42 27.42"
+  roman-pa-availability 14 26 9.707 +44 42 27.42 --label "NGC 5457"
   roman-pa-availability 83.82 -5.39 --output pa.png --csv pa.csv
   roman-pa-availability 83.82 -5.39 --pitch-limit 36 --roll-limit 15
         """,
     )
 
-    parser.add_argument('ra',  type=float, help='Target RA in degrees (ICRS).')
-    parser.add_argument('dec', type=float, help='Target Dec in degrees (ICRS).')
+    parser.add_argument(
+        'coords',
+        type=str,
+        nargs='+',
+        metavar='TOKEN',
+        help=(
+            'Target coordinates (ICRS). '
+            'Decimal degrees: RA DEC  e.g. 83.82 -5.39  '
+            'Sexagesimal: "h m s" "+d m s"  e.g. "14 26 9.707" "+44 42 27.42"  '
+            'or six bare tokens: 14 26 9.707 +44 42 27.42'
+        ),
+    )
     parser.add_argument(
         '--year', type=int, default=None,
         help='Calendar year to survey (default: current year).',
@@ -2516,19 +2644,57 @@ Examples:
         '--figsize', type=float, nargs=2, metavar=('W', 'H'), default=(12, 5),
         help='Figure size in inches (default: 12 5).',
     )
+    parser.add_argument(
+        '--pa', type=float, default=None, metavar='DEG',
+        help=(
+            'Requested V3 position angle in degrees [0, 360). '
+            'When supplied, days where this PA is reachable are highlighted '
+            'and a pa_available column is added to the CSV output.'
+        ),
+    )
+    parser.add_argument(
+        '--pa-tol', type=float, default=1.0, metavar='DEG',
+        help='Tolerance for the PA check in degrees (default: 1.0).',
+    )
 
     args = parser.parse_args()
 
+    # Parse coordinate tokens (2 decimal or 6 sexagesimal)
+    tokens = [t for raw in args.coords for t in raw.split()]
+    if len(tokens) == 2:
+        ra_deg  = _parse_angle(tokens[0:1], is_ra=False)
+        dec_deg = _parse_angle(tokens[1:2], is_ra=False)
+    elif len(tokens) == 6:
+        ra_deg  = _parse_angle(tokens[0:3], is_ra=True)
+        dec_deg = _parse_angle(tokens[3:6], is_ra=False)
+    else:
+        parser.error(
+            f'Coordinates require 2 tokens (decimal degrees) or 6 tokens '
+            f'(RA h m s Dec d m s), got {len(tokens)}: {tokens}'
+        )
+
     fig, _, df = plot_pa_availability(
-        ra=args.ra,
-        dec=args.dec,
+        ra=ra_deg,
+        dec=dec_deg,
         year=args.year,
         pitch_limit=args.pitch_limit,
         roll_limit=args.roll_limit,
         n_days=args.n_days,
         fig_size=tuple(args.figsize),
         label=args.label,
+        pa=args.pa,
+        pa_tol=args.pa_tol,
     )
+
+    if args.pa is not None and 'pa_available' in df.columns:
+        windows = df[df['pa_available']][['date', 'pitch_deg', 'pa_nominal',
+                                          'pa_min', 'pa_max']]
+        if windows.empty:
+            print(f'PA={args.pa:.1f}° is not reachable on any day in {args.year}.')
+        else:
+            print(f'\nDays where PA={args.pa:.1f}° (±{args.pa_tol}°) is accessible '
+                  f'({len(windows)} / {len(df)} days):')
+            print(windows.to_string(index=False))
 
     if args.csv:
         df.to_csv(args.csv, index=False)
